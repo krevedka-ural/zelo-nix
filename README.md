@@ -14,14 +14,15 @@ zelo -n -c red               # dry run, print the HID packet
 
 ```nix
 # flake.nix
-inputs.zelo.url = "github:<you>/zelo";   # or path:/home/you/zelo
+inputs = {
+  zelo.url = "github:krevedka-ural/zelo-nix";
+};
 
 # configuration.nix
-imports = [ inputs.zelo.nixosModules.default ];
-programs.zelo.enable = true;             # installs zelo + udev rule (uaccess)
+imports = [
+  inputs.zelo.nixosModules.default
+];
+programs.zelo.enable = true;
 ```
-
-Try without installing: `nix run github:<you>/zelo -- -c red`
-(needs the udev rule once, otherwise `sudo` or "permission denied").
 
 Packet format and how it was found: see the header of `zelo`.
