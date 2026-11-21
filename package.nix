@@ -1,23 +1,20 @@
-{ lib, stdenvNoCC, python3 }:
+{ lib, python3Packages }:
 
-stdenvNoCC.mkDerivation {
+python3Packages.buildPythonApplication {
   pname = "zelo";
-  version = "0.1.0";
+  version = "0.2.0";
+  pyproject = true;
 
-  dontUnpack = true;
-  dontBuild = true;
+  src = lib.cleanSource ./.;
 
-  # python3 in buildInputs so patchShebangs points the script at the store python
-  buildInputs = [ python3 ];
+  build-system = [ python3Packages.setuptools ];
 
-  installPhase = ''
-    runHook preInstall
-    install -Dm755 ${./zelo} $out/bin/zelo
-    runHook postInstall
-  '';
+  # stdlib only; tests (fake mouse): python3 -m unittest discover -s tests
+  doCheck = false;
+  pythonImportsCheck = [ "zelo" ];
 
   meta = {
-    description = "Zelotes F-36 RGB panel color picker";
+    description = "Zelotes F-36 mouse control (RGB panel, memory dump)";
     mainProgram = "zelo";
     platforms = lib.platforms.linux;
   };
