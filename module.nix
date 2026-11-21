@@ -19,9 +19,13 @@ in
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
-    # let the logged-in (seat) user talk to the mouse's hidraw nodes without root
-    services.udev.extraRules = ''
-      SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", ATTRS{idProduct}=="fa68", TAG+="uaccess"
-    '';
+    # Let the logged-in (seat) user talk to the mouse's hidraw nodes without root.
+    # Must be a rules.d file numbered < 73: `uaccess` is processed by
+    # 73-seat-late.rules, so services.udev.extraRules (99-local.rules) is too late.
+    services.udev.packages = [
+      (pkgs.writeTextDir "lib/udev/rules.d/70-zelo.rules" ''
+        SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", ATTRS{idProduct}=="fa68", TAG+="uaccess"
+      '')
+    ];
   };
 }
