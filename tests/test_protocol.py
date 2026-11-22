@@ -87,5 +87,136 @@ class Tests(unittest.TestCase):
         self.assertIsNone(P.decode_led(bytes([1, 2, 3, 4, 5, 6, 7])))
 
 
+def factory_image():
+    """A plausible 0x3c config image: 250 Hz (2.4G) / 125 Hz (BT), 5 stages, level 2."""
+    img = bytearray(P.CONFIG_LEN)
+    img[0:2] = P.encode_pair(P.encode_rate(250, 125))
+    img[2:4] = P.encode_pair(5)
+    img[4:6] = P.encode_pair(2)
+    for i, v in enumerate([800, 1200, 1600, 2400, 2400]):
+        img[6 + 3 * i:9 + 3 * i] = P.encode_dpi(v)
+    keys = [(1, 0x11), (1, 0x12), (1, 0x13), (1, 0x14), (1, 0x15), (8, 0xAA), (8, 0xAE), (8, 0xA2)]
+    for i, (t, c) in enumerate(keys):
+        img[0x15 + 4 * i:0x19 + 4 * i] = P.encode_key(t, c)
+    img[0x35:0x3C] = P.encode_led(1, [255, 0, 0], 2, 2)
+    return bytes(img)
+
+
+class MoreProtocolTests(unittest.TestCase):
+    def test_rate_codes(self):
+        self.assertEqual(P.encode_rate(250, 125), 0x84)
+        self.assertEqual(P.decode_rate(0x84), (250, 125))
+        # leaving a nibble as None keeps it
+        self.assertEqual(P.encode_rate(500, None, 0x84), 0x82)
+        self.assertEqual(P.encode_rate(None, 250, 0x82), 0x42)
+
+    def test_dpi_table(self):
+        self.assertEqual(P.encode_dpi(800), bytes([0x15, 0x15, P.checksum([0x15, 0x15])]))
+        self.assertEqual(len(P.SENSOR_DPI), 21)
+        with self.assertRaises(ValueError):
+            P.encode_dpi(850)
+
+    def test_decode_config(self):
+        c = P.decode_config(factory_image())
+        self.assertEqual(P.decode_rate(c["rate_byte"]), (250, 125))
+        self.assertEqual((c["stages"], c["level"]), (5, 2))
+        self.assertEqual([d["dpi"] for d in c["dpi"]], [800, 1200, 1600, 2400, 2400])
+        self.assertTrue(all(k["ok"] for k in c["keys"]))
+        self.assertEqual(c["keys"][5]["type"], 8)
+        self.assertEqual(c["led"]["color"], [255, 0, 0])
+        self.assertTrue(P.config_is_sane(factory_image()))
+
+    def test_sanity_detects_corruption(self):
+        bad = bytearray(factory_image())
+        bad[0x07] ^= 0xFF
+        self.assertFalse(P.config_is_sane(bytes(bad)))
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from zelo import cli
+        self.cli = cli
+        self.tmp = tempfile.mkdtemp()
+        cli.STATE_PATH = os.path.join(self.tmp, "state.json")
+        cli.BACKUP_DIR = os.path.join(self.tmp, "backups")
+        self.fake = FakeTransport()
+        self.fake.mem[0:P.CONFIG_LEN] = factory_image()
+        cli.open_mouse = lambda path: P.Mouse(self.fake)
+        self._real_sleep = None
+
+    def run_cli(self, *argv):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.cli.main(list(argv))
+        return buf.getvalue()
+
+    def cfg(self):
+        return P.decode_config(bytes(self.fake.mem[:P.CONFIG_LEN]))
+
+    def test_rate_show_and_set(self):
+        self.assertIn("2.4G 250 Hz, BT 125 Hz", self.run_cli("rate"))
+        self.run_cli("rate", "500")
+        self.assertEqual(P.decode_rate(self.cfg()["rate_byte"]), (500, 125))
+        self.run_cli("rate", "--bt", "250")
+        self.assertEqual(P.decode_rate(self.cfg()["rate_byte"]), (500, 250))
+        with self.assertRaises(SystemExit):
+            self.run_cli("rate", "1000")
+
+    def test_dpi_set_and_backup(self):
+        out = self.run_cli("dpi", "400", "800", "1600")
+        self.assertIn("3 enabled", out)
+        c = self.cfg()
+        self.assertEqual([d["dpi"] for d in c["dpi"][:3]], [400, 800, 1600])
+        self.assertEqual(c["stages"], 3)
+        self.assertEqual(c["level"], 2)  # still valid: 0 <= 2 < 3
+        files = os.listdir(self.cli.BACKUP_DIR)
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(self.cli.BACKUP_DIR, files[0]), "rb") as f:
+            self.assertEqual(f.read(), factory_image())  # backup = state before the write
+
+    def test_dpi_stage_validation(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("dpi", "--stage", "9")
+        with self.assertRaises(SystemExit):
+            self.run_cli("dpi", "850")
+        self.run_cli("dpi", "--stage", "1")
+        self.assertEqual(self.cfg()["level"], 0)
+
+    def test_restore_roundtrip(self):
+        import tempfile
+        self.run_cli("dpi", "400", "400", "400", "400", "400")
+        path = os.path.join(self.tmp, "orig.bin")
+        with open(path, "wb") as f:
+            f.write(factory_image())
+        out = self.run_cli("restore", path)  # no --yes: dry
+        self.assertIn("--yes", out)
+        self.assertEqual(self.cfg()["dpi"][0]["dpi"], 400)
+        self.run_cli("restore", path, "--yes")
+        self.assertEqual(bytes(self.fake.mem[:P.CONFIG_LEN]), factory_image())
+
+    def test_restore_rejects_garbage(self):
+        path = os.path.join(self.tmp, "bad.bin")
+        with open(path, "wb") as f:
+            f.write(b"\x00" * P.CONFIG_LEN)
+        with self.assertRaises(SystemExit):
+            self.run_cli("restore", path, "--yes")
+
+    def test_info_and_keys_read_only(self):
+        before = bytes(self.fake.mem)
+        out = self.run_cli("info")
+        self.assertIn("stage 3: 1600 DPI", out)
+        self.assertIn("slot 5: 08 aa 00", out)
+        self.run_cli("keys")
+        self.assertEqual(bytes(self.fake.mem), before)
+
+    def test_led_uses_mouse_state(self):
+        self.run_cli("-c", "blue")
+        led = self.cfg()["led"]
+        self.assertEqual((led["mode"], led["color"]), (1, [0, 0, 255]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,10 @@
     zelo -c "#ff8800" -s 3 -l 4  speed / brightness
     zelo                         show current LED state
     zelo info                    decode the main config block
+    zelo rate [125|250|500] [--bt HZ]   polling rate
+    zelo dpi [800 1200 ...] [--stage N] [--count N]   DPI stages
+    zelo keys                    show the button matrix (read-only for now)
+    zelo restore FILE --yes      write back a backup made by zelo
     zelo dump -o backup.bin      hexdump / save mouse memory (read-only)
     zelo read 0x35 7             read raw bytes
 """
@@ -107,7 +111,7 @@ def hexdump(data, base=0):
 def cmd_set(argv):
     ap = argparse.ArgumentParser(
         prog="zelo", description="Zelotes F-36 RGB panel color picker",
-        epilog="other commands: zelo info | zelo dump | zelo read")
+        epilog="other commands: info dump read rate dpi keys restore")
     ap.add_argument("-c", "--color", type=parse_color, metavar="COLOR",
                     help="red,green,blue,cyan,magenta,white,yellow,orange or #rrggbb")
     ap.add_argument("-m", "--mode", choices=MODES, metavar="MODE",
@@ -168,35 +172,178 @@ def cmd_set(argv):
             mouse.close()
 
 
+# --- backups ----------------------------------------------------------------
+
+BACKUP_DIR = os.path.join(os.path.dirname(STATE_PATH), "backups")
+
+
+def backup(mouse):
+    """Save the 0x00..0x3b config block before touching it. Returns the file path."""
+    import time
+    data = mouse.read_config()
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    path = os.path.join(BACKUP_DIR, time.strftime("%Y%m%d-%H%M%S") + ".bin")
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def read_cfg_or_die(mouse):
+    try:
+        data = mouse.read_config()
+    except P.ZeloError as e:
+        sys.exit(f"zelo: {e}")
+    return data, P.decode_config(data)
+
+
+def fmt_rate(byte):
+    if byte is None:
+        return "unreadable (checksum mismatch)"
+    g, b = P.decode_rate(byte)
+    f = lambda hz: f"{hz} Hz" if hz else "-"  # noqa: E731
+    return f"2.4G {f(g)}, BT {f(b)}  (byte 0x{byte:02x})"
+
+
+def fmt_dpi_slot(d):
+    if d["dpi"]:
+        return f"{d['dpi']} DPI"
+    return f"code X=0x{d['x']:02x} Y=0x{d['y']:02x}"
+
+
+def safe_write(mouse, what, fn):
+    """Back up the config block, run fn(), report."""
+    try:
+        path = backup(mouse)
+        fn()
+    except P.ZeloError as e:
+        sys.exit(f"zelo: {e}")
+    print(f"{what}  (backup: {path})")
+
+
 # --- zelo info --------------------------------------------------------------
-
-def _records(data, base, size, count):
-    for i in range(count):
-        rec = data[base + i * size: base + (i + 1) * size]
-        ok = P.checksum(rec[:-1]) == rec[-1]
-        yield i, rec, ok
-
 
 def cmd_info(argv):
     ap = argparse.ArgumentParser(prog="zelo info", description="decode the main config block")
     ap.add_argument("-d", "--device", metavar="PATH")
     a = ap.parse_args(argv)
     with open_mouse(a.device) as m:
-        try:
-            data = m.read(0x00, 0x3C)
-        except P.ZeloError as e:
-            sys.exit(f"zelo: {e}")
-    led = P.decode_led(data[P.ADDR_LED:P.ADDR_LED + P.LED_LEN])
-    print(f"LED @0x35: {fmt_state(led)} [checksum ok]" if led
-          else f"LED @0x35: {data[0x35:0x3c].hex(' ')} [checksum MISMATCH]")
-    print("\nDPI stages @0x06 (5 x 3 B; layout not verified yet):")
-    for i, rec, ok in _records(data, 0x06, 3, 5):
-        print(f"  #{i + 1}: {rec.hex(' ')}  chk {'ok' if ok else 'no'}")
-    print("\nDPI colors @0x15 (8 x 4 B; layout not verified yet):")
-    for i, rec, ok in _records(data, 0x15, 4, 8):
-        print(f"  #{i + 1}: {rec.hex(' ')}  chk {'ok' if ok else 'no'}")
+        data, c = read_cfg_or_die(m)
+
+    print(f"polling rate: {fmt_rate(c['rate_byte'])}")
+    n, lv = c["stages"], c["level"]
+    print(f"DPI stages:   {n if n is not None else '?'} enabled, "
+          f"current level {lv if lv is not None else '?'}"
+          + (f" (stage {lv + 1} if 0-based)" if lv is not None else ""))
+    for i, d in enumerate(c["dpi"]):
+        print(f"  stage {i + 1}: {fmt_dpi_slot(d)}  chk {'ok' if d['ok'] else 'BAD'}")
+    print(f"LED:          {fmt_state(c['led'])}" if c["led"] else "LED:          checksum MISMATCH")
+    print("buttons (key matrix, slot: type code param):")
+    for i, k in enumerate(c["keys"]):
+        print(f"  slot {i}: {k['type']:02x} {k['code']:02x} {k['param']:02x}  chk {'ok' if k['ok'] else 'BAD'}")
     print("\nraw 0x00..0x3b:")
     print(hexdump(data))
+
+
+def cmd_keys(argv):
+    ap = argparse.ArgumentParser(prog="zelo keys", description="show the button matrix")
+    ap.add_argument("-d", "--device", metavar="PATH")
+    a = ap.parse_args(argv)
+    with open_mouse(a.device) as m:
+        _, c = read_cfg_or_die(m)
+    for i, k in enumerate(c["keys"]):
+        print(f"slot {i}: type=0x{k['type']:02x} code=0x{k['code']:02x} param=0x{k['param']:02x}"
+              f"  chk {'ok' if k['ok'] else 'BAD'}")
+
+
+# --- zelo rate --------------------------------------------------------------
+
+def cmd_rate(argv):
+    ap = argparse.ArgumentParser(prog="zelo rate", description="polling rate")
+    ap.add_argument("hz", nargs="?", type=int, help="2.4G/wired rate: 125, 250 or 500")
+    ap.add_argument("--bt", type=int, metavar="HZ", help="Bluetooth rate: 125, 250 or 500")
+    ap.add_argument("--force", action="store_true", help="allow 1000 Hz (the driver does not read it back)")
+    ap.add_argument("-d", "--device", metavar="PATH")
+    a = ap.parse_args(argv)
+    allowed = {125, 250, 500} | ({1000} if a.force else set())
+    for v in (a.hz, a.bt):
+        if v is not None and v not in allowed:
+            sys.exit(f"zelo: rate must be one of {sorted(allowed)}")
+    with open_mouse(a.device) as m:
+        _, c = read_cfg_or_die(m)
+        cur = c["rate_byte"]
+        if cur is None:
+            sys.exit("zelo: current rate byte failed its checksum, refusing to write")
+        if a.hz is None and a.bt is None:
+            print(fmt_rate(cur))
+            return
+        new = P.encode_rate(a.hz, a.bt, cur)
+        safe_write(m, f"polling rate -> {fmt_rate(new)}", lambda: m.write_rate_byte(new))
+
+
+# --- zelo dpi ---------------------------------------------------------------
+
+def cmd_dpi(argv):
+    ap = argparse.ArgumentParser(prog="zelo dpi", description="DPI stages")
+    ap.add_argument("values", nargs="*", type=int, help="DPI for stage 1, 2, ... (400..2400 step 100)")
+    ap.add_argument("--stage", type=int, metavar="N", help="select current stage (1-based)")
+    ap.add_argument("--count", type=int, metavar="N", help="number of enabled stages (1..5)")
+    ap.add_argument("-d", "--device", metavar="PATH")
+    a = ap.parse_args(argv)
+
+    if len(a.values) > P.DPI_SLOTS:
+        sys.exit(f"zelo: at most {P.DPI_SLOTS} stages")
+    for v in a.values:
+        if v not in P.SENSOR_DPI:
+            sys.exit(f"zelo: {v} DPI not supported; use 400..2400 in steps of 100")
+    if a.count is not None and not 1 <= a.count <= P.DPI_SLOTS:
+        sys.exit(f"zelo: --count must be 1..{P.DPI_SLOTS}")
+
+    with open_mouse(a.device) as m:
+        _, c = read_cfg_or_die(m)
+        if not a.values and a.stage is None and a.count is None:
+            n, lv = c["stages"], c["level"]
+            for i, d in enumerate(c["dpi"]):
+                mark = "*" if lv is not None and i == lv else " "
+                off = "" if n is None or i < n else "  (disabled)"
+                print(f"{mark} stage {i + 1}: {fmt_dpi_slot(d)}{off}")
+            return
+        if c["stages"] is None or c["level"] is None:
+            sys.exit("zelo: stage count/level failed their checksum, refusing to write")
+
+        count = a.count if a.count is not None else (len(a.values) if a.values else c["stages"])
+        stage = (a.stage - 1) if a.stage is not None else c["level"]
+        if not 0 <= stage < count:
+            sys.exit(f"zelo: stage must be 1..{count}")
+
+        def apply():
+            for i, v in enumerate(a.values):
+                m.write_dpi(i, v)
+            if count != c["stages"]:
+                m.write_stages(count)
+            if stage != c["level"]:
+                m.write_level(stage)
+
+        safe_write(m, f"dpi stages updated ({count} enabled, current stage {stage + 1})", apply)
+
+
+# --- zelo restore -----------------------------------------------------------
+
+def cmd_restore(argv):
+    ap = argparse.ArgumentParser(prog="zelo restore", description="write back a config backup")
+    ap.add_argument("file")
+    ap.add_argument("--yes", action="store_true", help="really write")
+    ap.add_argument("-d", "--device", metavar="PATH")
+    a = ap.parse_args(argv)
+    with open(a.file, "rb") as f:
+        data = f.read()
+    if len(data) != P.CONFIG_LEN or not P.config_is_sane(data):
+        sys.exit(f"zelo: {a.file} is not a valid config image ({P.CONFIG_LEN} bytes, all checksums ok)")
+    if not a.yes:
+        print(hexdump(data))
+        print("\nrun again with --yes to write this to the mouse")
+        return
+    with open_mouse(a.device) as m:
+        safe_write(m, "config restored", lambda: m.write(0, data))
 
 
 # --- zelo dump / read -------------------------------------------------------
@@ -235,7 +382,8 @@ def cmd_read(argv):
             sys.exit(f"zelo: {e}")
 
 
-COMMANDS = {"info": cmd_info, "dump": cmd_dump, "read": cmd_read}
+COMMANDS = {"info": cmd_info, "dump": cmd_dump, "read": cmd_read, "rate": cmd_rate,
+            "dpi": cmd_dpi, "keys": cmd_keys, "restore": cmd_restore}
 
 
 def main(argv=None):

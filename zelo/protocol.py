@@ -17,10 +17,16 @@ The mouse answers on an input report whose payload mirrors the request:
 (the driver treats it as a 16-byte message; whether the kernel hands us a
 leading report-ID byte depends on the descriptor, so both layouts are accepted).
 
-Known memory map (from driver code; see zelo.cli `info`):
-    0x00..0x34  main config; DPI stages @0x06 (5 x 3 B), DPI colors @0x15 (8 x 4 B)
-    0x35..0x3b  LED block: mode, R, G, B, speed, light, checksum
-    0x200+      macros, 0x180 bytes per slot
+Memory map (confirmed by the driver's own debug strings):
+    0x00,0x01  polling rate byte + checksum   (low nibble 2.4G, high nibble BT;
+                                               codes 1=1000Hz 2=500 4=250 8=125)
+    0x02,0x03  number of DPI stages + checksum
+    0x04,0x05  current DPI level + checksum
+    0x06..0x14 DPI stages, 5 x [X, Y, chk]     (X/Y = sensor code, see SENSOR_DPI)
+    0x15..0x34 key matrix, 8 x [type, code, param, chk]
+    0x35..0x3b LED block: mode, R, G, B, speed, light, checksum
+    0x200+     macros, 0x180 bytes per slot
+Every record ends with chk = (0x55 - sum(record bytes)) & 0xff.
 
 Transport is plain /dev/hidrawN + ioctl(HIDIOCSFEATURE), stdlib only.
 """
@@ -40,6 +46,28 @@ CHUNK = 8  # max data bytes per packet (13-byte payload - 5 header bytes)
 
 ADDR_LED = 0x0035
 LED_LEN = 7
+
+ADDR_RATE = 0x00
+ADDR_STAGES = 0x02
+ADDR_LEVEL = 0x04
+ADDR_DPI = 0x06
+ADDR_KEYS = 0x15
+CONFIG_LEN = 0x3C        # 0x00..0x3b
+DPI_SLOTS = 5
+KEY_SLOTS = 8
+
+# polling rate nibble codes
+RATE_CODES = {1000: 1, 500: 2, 250: 4, 125: 8}
+RATE_HZ = {v: k for k, v in RATE_CODES.items()}
+
+# Sensor 0x3212 (PixArt PAW3212 class): DPI -> resolution code, from the driver's table.
+SENSOR_DPI = {
+    400: 0x0B, 500: 0x0D, 600: 0x10, 700: 0x12, 800: 0x15, 900: 0x17,
+    1000: 0x1A, 1100: 0x1D, 1200: 0x1F, 1300: 0x22, 1400: 0x25, 1500: 0x27,
+    1600: 0x2A, 1700: 0x2D, 1800: 0x2F, 1900: 0x32, 2000: 0x34, 2100: 0x37,
+    2200: 0x3A, 2300: 0x3C, 2400: 0x3F,
+}
+DPI_FROM_CODE = {v: k for k, v in SENSOR_DPI.items()}
 
 
 class ZeloError(Exception):
@@ -87,6 +115,72 @@ def decode_led(raw):
     if len(raw) != LED_LEN or checksum(raw[:6]) != raw[6]:
         return None
     return {"mode": raw[0], "color": list(raw[1:4]), "speed": raw[4], "light": raw[5]}
+
+
+# --- single-byte / record helpers ---------------------------------------------
+
+def encode_pair(v):
+    return bytes([v, checksum([v])])
+
+
+def decode_pair(raw):
+    """[value, chk] -> value or None."""
+    return raw[0] if len(raw) == 2 and checksum(raw[:1]) == raw[1] else None
+
+
+def encode_rate(g24=None, bt=None, current=0):
+    """Rate byte from Hz values; a nibble left as None keeps its bits from `current`."""
+    lo = current & 0x0F if g24 is None else RATE_CODES[g24]
+    hi = (current >> 4) & 0x0F if bt is None else RATE_CODES[bt]
+    return (hi << 4) | lo
+
+
+def decode_rate(byte):
+    """-> (g24_hz, bt_hz); None for an unknown/unused nibble."""
+    return RATE_HZ.get(byte & 0x0F), RATE_HZ.get(byte >> 4)
+
+
+def encode_dpi(dpi):
+    if dpi not in SENSOR_DPI:
+        raise ValueError(f"DPI {dpi} not supported (400..2400 step 100)")
+    c = SENSOR_DPI[dpi]
+    return bytes([c, c, checksum([c, c])])
+
+
+def encode_key(kind, code, param=0):
+    rec = [kind, code, param]
+    return bytes(rec + [checksum(rec)])
+
+
+def decode_config(data):
+    """Decode bytes 0x00..0x3b into a dict; every field carries its own checksum verdict."""
+    if len(data) < CONFIG_LEN:
+        raise ValueError("config block too short")
+    cfg = {}
+    cfg["rate_byte"] = decode_pair(data[0:2])
+    cfg["stages"] = decode_pair(data[2:4])
+    cfg["level"] = decode_pair(data[4:6])
+    cfg["dpi"] = []
+    for i in range(DPI_SLOTS):
+        rec = data[ADDR_DPI + 3 * i: ADDR_DPI + 3 * i + 3]
+        ok = checksum(rec[:2]) == rec[2]
+        cfg["dpi"].append({"x": rec[0], "y": rec[1], "ok": ok,
+                           "dpi": DPI_FROM_CODE.get(rec[0]) if rec[0] == rec[1] else None})
+    cfg["keys"] = []
+    for i in range(KEY_SLOTS):
+        rec = data[ADDR_KEYS + 4 * i: ADDR_KEYS + 4 * i + 4]
+        cfg["keys"].append({"type": rec[0], "code": rec[1], "param": rec[2],
+                            "ok": checksum(rec[:3]) == rec[3]})
+    cfg["led"] = decode_led(data[ADDR_LED:ADDR_LED + LED_LEN])
+    return cfg
+
+
+def config_is_sane(data):
+    """True if every checksummed field in a 0x3c-byte image verifies (used by restore)."""
+    c = decode_config(data)
+    return (c["rate_byte"] is not None and c["stages"] is not None and c["level"] is not None
+            and all(d["ok"] for d in c["dpi"]) and all(k["ok"] for k in c["keys"])
+            and c["led"] is not None)
 
 
 # --- transport --------------------------------------------------------------
@@ -230,3 +324,23 @@ class Mouse:
 
     def write_led(self, mode, rgb, speed, light):
         return self.write(ADDR_LED, encode_led(mode, rgb, speed, light))
+
+    # --- typed helpers -----------------------------------------------------
+
+    def read_config(self):
+        return self.read(0, CONFIG_LEN)
+
+    def write_rate_byte(self, byte):
+        return self.write(ADDR_RATE, encode_pair(byte))
+
+    def write_stages(self, n):
+        return self.write(ADDR_STAGES, encode_pair(n))
+
+    def write_level(self, n):
+        return self.write(ADDR_LEVEL, encode_pair(n))
+
+    def write_dpi(self, slot, dpi):
+        return self.write(ADDR_DPI + 3 * slot, encode_dpi(dpi))
+
+    def write_key(self, slot, kind, code, param=0):
+        return self.write(ADDR_KEYS + 4 * slot, encode_key(kind, code, param))
