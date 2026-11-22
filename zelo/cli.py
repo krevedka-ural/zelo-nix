@@ -4,6 +4,7 @@
     zelo -m rainbow              set mode             (off static rainbow rainbow_clippy breathing)
     zelo -c "#ff8800" -s 3 -l 4  speed / brightness
     zelo                         show current LED state
+    zelo -w 10 -c red            keep re-sending up to 10 s until the (sleeping) mouse acknowledges
     zelo info                    decode the main config block
     zelo rate [125|250|500] [--bt HZ]   polling rate
     zelo dpi [800 1200 ...] [--stage N] [--count N]   DPI stages
@@ -118,9 +119,8 @@ def cmd_set(argv):
                     help="off,static,rainbow,rainbow_clippy (+ breathing)")
     ap.add_argument("-s", "--speed", type=int, metavar="N", help="effect speed")
     ap.add_argument("-l", "--light", type=int, metavar="N", help="brightness")
-    ap.add_argument("-d", "--device", metavar="PATH", help="force /dev/hidrawN")
+    add_common(ap)
     ap.add_argument("-n", "--dry-run", action="store_true", help="print packet, don't send")
-    ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
 
     changing = any(v is not None for v in (a.color, a.mode, a.speed, a.light))
@@ -161,11 +161,13 @@ def cmd_set(argv):
             print(P.build_request(P.CMD_WRITE, P.ADDR_LED, raw).hex(" "))
             return
         try:
-            acked = mouse.write(P.ADDR_LED, raw)
+            acked = mouse.write(P.ADDR_LED, raw, wait=a.wait)
         except P.ZeloError as e:
             sys.exit(f"zelo: {e}")
         if a.verbose:
             print(f"sent {fmt_state(st)}; acknowledged: {acked}", file=sys.stderr)
+        if not acked and (a.verbose or a.wait > 0):
+            print(ASLEEP_HINT, file=sys.stderr)
         save_cache(st)
     finally:
         if mouse is not None:
@@ -204,20 +206,45 @@ def fmt_rate(byte):
     return f"2.4G {f(g)}, BT {f(b)}  (byte 0x{byte:02x})"
 
 
+BUTTON_BITS = {0x01: "left", 0x02: "right", 0x04: "middle", 0x08: "back", 0x10: "forward"}
+
+
+def fmt_key(k):
+    base = f"{k['type']:02x} {k['code']:02x} {k['param']:02x}"
+    if k["type"] == 0x01 and k["code"] in BUTTON_BITS:
+        return f"{base}  mouse button: {BUTTON_BITS[k['code']]}"
+    if k["type"] in (0x02, 0x05):
+        return f"{base}  function (DPI-related?)"
+    return base
+
+
 def fmt_dpi_slot(d):
     if d["dpi"]:
         return f"{d['dpi']} DPI"
     return f"code X=0x{d['x']:02x} Y=0x{d['y']:02x}"
 
 
-def safe_write(mouse, what, fn):
-    """Back up the config block, run fn(), report."""
+ASLEEP_HINT = ("zelo: no acknowledgement from the mouse (asleep?). The dongle may still "
+               "deliver the change when it wakes up; move the mouse, or use -w SECONDS to keep retrying.")
+
+
+def add_common(ap):
+    ap.add_argument("-d", "--device", metavar="PATH", help="force /dev/hidrawN")
+    ap.add_argument("-w", "--wait", type=float, default=0.0, metavar="SEC",
+                    help="re-send until acknowledged, up to SEC seconds (wireless mouse asleep)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+
+
+def safe_write(mouse, what, fn, wait=0.0, verbose=False):
+    """Back up the config block, run fn() (returns acked: bool), report."""
     try:
         path = backup(mouse)
-        fn()
+        acked = fn()
     except P.ZeloError as e:
         sys.exit(f"zelo: {e}")
     print(f"{what}  (backup: {path})")
+    if not acked and (verbose or wait > 0):
+        print(ASLEEP_HINT, file=sys.stderr)
 
 
 # --- zelo info --------------------------------------------------------------
@@ -239,7 +266,7 @@ def cmd_info(argv):
     print(f"LED:          {fmt_state(c['led'])}" if c["led"] else "LED:          checksum MISMATCH")
     print("buttons (key matrix, slot: type code param):")
     for i, k in enumerate(c["keys"]):
-        print(f"  slot {i}: {k['type']:02x} {k['code']:02x} {k['param']:02x}  chk {'ok' if k['ok'] else 'BAD'}")
+        print(f"  slot {i}: {fmt_key(k)}  chk {'ok' if k['ok'] else 'BAD'}")
     print("\nraw 0x00..0x3b:")
     print(hexdump(data))
 
@@ -251,8 +278,7 @@ def cmd_keys(argv):
     with open_mouse(a.device) as m:
         _, c = read_cfg_or_die(m)
     for i, k in enumerate(c["keys"]):
-        print(f"slot {i}: type=0x{k['type']:02x} code=0x{k['code']:02x} param=0x{k['param']:02x}"
-              f"  chk {'ok' if k['ok'] else 'BAD'}")
+        print(f"slot {i}: {fmt_key(k)}  chk {'ok' if k['ok'] else 'BAD'}")
 
 
 # --- zelo rate --------------------------------------------------------------
@@ -262,7 +288,7 @@ def cmd_rate(argv):
     ap.add_argument("hz", nargs="?", type=int, help="2.4G/wired rate: 125, 250 or 500")
     ap.add_argument("--bt", type=int, metavar="HZ", help="Bluetooth rate: 125, 250 or 500")
     ap.add_argument("--force", action="store_true", help="allow 1000 Hz (the driver does not read it back)")
-    ap.add_argument("-d", "--device", metavar="PATH")
+    add_common(ap)
     a = ap.parse_args(argv)
     allowed = {125, 250, 500} | ({1000} if a.force else set())
     for v in (a.hz, a.bt):
@@ -277,7 +303,8 @@ def cmd_rate(argv):
             print(fmt_rate(cur))
             return
         new = P.encode_rate(a.hz, a.bt, cur)
-        safe_write(m, f"polling rate -> {fmt_rate(new)}", lambda: m.write_rate_byte(new))
+        safe_write(m, f"polling rate -> {fmt_rate(new)}",
+                   lambda: m.write_rate_byte(new, wait=a.wait), a.wait, a.verbose)
 
 
 # --- zelo dpi ---------------------------------------------------------------
@@ -287,7 +314,7 @@ def cmd_dpi(argv):
     ap.add_argument("values", nargs="*", type=int, help="DPI for stage 1, 2, ... (400..2400 step 100)")
     ap.add_argument("--stage", type=int, metavar="N", help="select current stage (1-based)")
     ap.add_argument("--count", type=int, metavar="N", help="number of enabled stages (1..5)")
-    ap.add_argument("-d", "--device", metavar="PATH")
+    add_common(ap)
     a = ap.parse_args(argv)
 
     if len(a.values) > P.DPI_SLOTS:
@@ -316,14 +343,17 @@ def cmd_dpi(argv):
             sys.exit(f"zelo: stage must be 1..{count}")
 
         def apply():
+            ok = True
             for i, v in enumerate(a.values):
-                m.write_dpi(i, v)
+                ok = m.write_dpi(i, v, wait=a.wait) and ok
             if count != c["stages"]:
-                m.write_stages(count)
+                ok = m.write_stages(count, wait=a.wait) and ok
             if stage != c["level"]:
-                m.write_level(stage)
+                ok = m.write_level(stage, wait=a.wait) and ok
+            return ok
 
-        safe_write(m, f"dpi stages updated ({count} enabled, current stage {stage + 1})", apply)
+        safe_write(m, f"dpi stages updated ({count} enabled, current stage {stage + 1})",
+                   apply, a.wait, a.verbose)
 
 
 # --- zelo restore -----------------------------------------------------------
@@ -332,7 +362,7 @@ def cmd_restore(argv):
     ap = argparse.ArgumentParser(prog="zelo restore", description="write back a config backup")
     ap.add_argument("file")
     ap.add_argument("--yes", action="store_true", help="really write")
-    ap.add_argument("-d", "--device", metavar="PATH")
+    add_common(ap)
     a = ap.parse_args(argv)
     with open(a.file, "rb") as f:
         data = f.read()
@@ -343,7 +373,7 @@ def cmd_restore(argv):
         print("\nrun again with --yes to write this to the mouse")
         return
     with open_mouse(a.device) as m:
-        safe_write(m, "config restored", lambda: m.write(0, data))
+        safe_write(m, "config restored", lambda: m.write(0, data, wait=a.wait), a.wait, a.verbose)
 
 
 # --- zelo dump / read -------------------------------------------------------

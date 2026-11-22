@@ -9,7 +9,8 @@ from zelo import protocol as P  # noqa: E402
 class FakeTransport:
     """Emulates the mouse memory; answers like the real device is believed to."""
 
-    def __init__(self, with_id=True, answer=True):
+    def __init__(self, with_id=True, answer=True, asleep_for=0):
+        self.asleep_for = asleep_for  # first N feature reports get no answer and no effect
         self.mem = bytearray(0x400)
         self.q = []
         self.with_id = with_id
@@ -22,6 +23,9 @@ class FakeTransport:
         self.sent.append(bytes(pkt))
         cmd, a, n = pkt[1], pkt[3] << 8 | pkt[4], pkt[5]
         assert n <= 8
+        if self.asleep_for > 0:
+            self.asleep_for -= 1
+            return
         if cmd == P.CMD_WRITE:
             self.mem[a:a + n] = pkt[6:6 + n]
             body = list(pkt[6:6 + n])
@@ -95,11 +99,32 @@ def factory_image():
     img[4:6] = P.encode_pair(2)
     for i, v in enumerate([800, 1200, 1600, 2400, 2400]):
         img[6 + 3 * i:9 + 3 * i] = P.encode_dpi(v)
-    keys = [(1, 0x11), (1, 0x12), (1, 0x13), (1, 0x14), (1, 0x15), (8, 0xAA), (8, 0xAE), (8, 0xA2)]
+    # slots as read from a real F-36: middle, fn, left, right, fn, back, fn, forward
+    keys = [(1, 0x04), (2, 0x01), (1, 0x01), (1, 0x02), (5, 0x00), (1, 0x08), (2, 0x02), (1, 0x10)]
     for i, (t, c) in enumerate(keys):
         img[0x15 + 4 * i:0x19 + 4 * i] = P.encode_key(t, c)
     img[0x35:0x3C] = P.encode_led(1, [255, 0, 0], 2, 2)
     return bytes(img)
+
+
+class SleepTests(unittest.TestCase):
+    def test_no_wait_reports_unacked(self):
+        t = FakeTransport(asleep_for=1)
+        with P.Mouse(t) as m:
+            self.assertFalse(m.write(0x10, b"\x01", ack_timeout=0.01))
+        self.assertEqual(t.mem[0x10], 0)
+
+    def test_wait_retries_until_awake(self):
+        t = FakeTransport(asleep_for=3)
+        with P.Mouse(t) as m:
+            self.assertTrue(m.write(0x10, b"\x07", ack_timeout=0.01, wait=2.0))
+        self.assertEqual(t.mem[0x10], 7)
+        self.assertEqual(len(t.sent), 4)  # 3 lost + 1 delivered
+
+    def test_wait_gives_up(self):
+        t = FakeTransport(asleep_for=10 ** 6)
+        with P.Mouse(t) as m:
+            self.assertFalse(m.write(0x10, b"\x07", ack_timeout=0.01, wait=0.1))
 
 
 class MoreProtocolTests(unittest.TestCase):
@@ -122,7 +147,7 @@ class MoreProtocolTests(unittest.TestCase):
         self.assertEqual((c["stages"], c["level"]), (5, 2))
         self.assertEqual([d["dpi"] for d in c["dpi"]], [800, 1200, 1600, 2400, 2400])
         self.assertTrue(all(k["ok"] for k in c["keys"]))
-        self.assertEqual(c["keys"][5]["type"], 8)
+        self.assertEqual((c["keys"][5]["type"], c["keys"][5]["code"]), (1, 0x08))
         self.assertEqual(c["led"]["color"], [255, 0, 0])
         self.assertTrue(P.config_is_sane(factory_image()))
 
@@ -208,9 +233,23 @@ class CliTests(unittest.TestCase):
         before = bytes(self.fake.mem)
         out = self.run_cli("info")
         self.assertIn("stage 3: 1600 DPI", out)
-        self.assertIn("slot 5: 08 aa 00", out)
+        self.assertIn("slot 5: 01 08 00  mouse button: back", out)
         self.run_cli("keys")
         self.assertEqual(bytes(self.fake.mem), before)
+
+    def test_wait_flag_with_sleeping_mouse(self):
+        self.fake.asleep_for = 2
+        P_write = P.Mouse.write
+        P.Mouse.write = lambda self, addr, data, ack_timeout=0.01, wait=0.0: P_write(self, addr, data, ack_timeout, wait)
+        try:
+            self.run_cli("-w", "2", "-c", "green")
+        finally:
+            P.Mouse.write = P_write
+        self.assertEqual(self.cfg()["led"]["color"], [0, 255, 0])
+
+    def test_keys_names(self):
+        out = self.run_cli("keys")
+        self.assertIn("mouse button: left", out)
 
     def test_led_uses_mouse_state(self):
         self.run_cli("-c", "blue")

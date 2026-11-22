@@ -305,16 +305,26 @@ class Mouse:
             time.sleep(0.005)
         return bytes(out)
 
-    def write(self, addr, data, ack_timeout=0.15):
-        """Write `data` at `addr`. Returns True if every chunk was acknowledged
-        (an unacknowledged write is not necessarily a failed one)."""
+    def write(self, addr, data, ack_timeout=0.3, wait=0.0):
+        """Write `data` at `addr`. Returns True if every chunk was acknowledged.
+
+        A wireless mouse that is asleep does not answer; with `wait` > 0 each chunk
+        is re-sent (writes are idempotent) until it is acknowledged or `wait`
+        seconds have passed. An unacknowledged write is not necessarily lost: the
+        dongle may deliver it when the mouse wakes up."""
         acked = True
         for off in range(0, len(data), CHUNK):
             chunk = bytes(data[off:off + CHUNK])
             a = addr + off
-            self.t.drain()
-            self.t.send_feature(build_request(CMD_WRITE, a, chunk))
-            got = self.t.wait(_matcher(CMD_WRITE, a, len(chunk), need_data=False), ack_timeout)
+            req = build_request(CMD_WRITE, a, chunk)
+            match = _matcher(CMD_WRITE, a, len(chunk), need_data=False)
+            deadline = time.monotonic() + wait
+            while True:
+                self.t.drain()
+                self.t.send_feature(req)
+                got = self.t.wait(match, ack_timeout)
+                if got is not None or time.monotonic() >= deadline:
+                    break
             acked = acked and got is not None
             time.sleep(0.005)
         return acked
@@ -330,17 +340,17 @@ class Mouse:
     def read_config(self):
         return self.read(0, CONFIG_LEN)
 
-    def write_rate_byte(self, byte):
-        return self.write(ADDR_RATE, encode_pair(byte))
+    def write_rate_byte(self, byte, **kw):
+        return self.write(ADDR_RATE, encode_pair(byte), **kw)
 
-    def write_stages(self, n):
-        return self.write(ADDR_STAGES, encode_pair(n))
+    def write_stages(self, n, **kw):
+        return self.write(ADDR_STAGES, encode_pair(n), **kw)
 
-    def write_level(self, n):
-        return self.write(ADDR_LEVEL, encode_pair(n))
+    def write_level(self, n, **kw):
+        return self.write(ADDR_LEVEL, encode_pair(n), **kw)
 
-    def write_dpi(self, slot, dpi):
-        return self.write(ADDR_DPI + 3 * slot, encode_dpi(dpi))
+    def write_dpi(self, slot, dpi, **kw):
+        return self.write(ADDR_DPI + 3 * slot, encode_dpi(dpi), **kw)
 
-    def write_key(self, slot, kind, code, param=0):
-        return self.write(ADDR_KEYS + 4 * slot, encode_key(kind, code, param))
+    def write_key(self, slot, kind, code, param=0, **kw):
+        return self.write(ADDR_KEYS + 4 * slot, encode_key(kind, code, param), **kw)
