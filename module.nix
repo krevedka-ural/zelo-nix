@@ -3,21 +3,32 @@ self:
 
 let
   cfg = config.programs.zelo;
+  system = pkgs.stdenv.hostPlatform.system;
 in
 {
   options.programs.zelo = {
-    enable = lib.mkEnableOption "zelo, the Zelotes F-36 RGB panel CLI (package + udev rule)";
+    enable = lib.mkEnableOption "zelo, the Zelotes F-36 CLI (package + udev rule)";
+
+    gui.enable = lib.mkEnableOption "the Qt GUI (zelo-gui; it also provides the zelo command)";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      default = self.packages.${system}.default;
       defaultText = lib.literalExpression "zelo.packages.\${system}.default";
-      description = "The zelo package to install.";
+      description = "The CLI-only zelo package.";
+    };
+
+    guiPackage = lib.mkOption {
+      type = lib.types.package;
+      default = self.packages.${system}.zelo-gui;
+      defaultText = lib.literalExpression "zelo.packages.\${system}.zelo-gui";
+      description = "The zelo package with the Qt GUI.";
     };
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ];
+    # one package only: both ship a `zelo` binary and the same python module
+    environment.systemPackages = [ (if cfg.gui.enable then cfg.guiPackage else cfg.package) ];
 
     # Let the logged-in (seat) user talk to the mouse's hidraw nodes without root.
     # Must be a rules.d file numbered < 73: `uaccess` is processed by

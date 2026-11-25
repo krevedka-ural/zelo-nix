@@ -1,0 +1,104 @@
+"""GUI logic test: runs against real PySide6 (offscreen) when installed, else is skipped.
+
+Device operations are executed synchronously against the fake mouse from
+test_protocol, so this covers: loading a snapshot into the widgets, collecting
+values from them, and the writes that result.
+"""
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+try:
+    from PySide6.QtWidgets import QApplication  # noqa: F401
+    HAVE_QT = True
+except ImportError:
+    HAVE_QT = False
+
+from test_protocol import FakeTransport, factory_image  # noqa: E402
+from zelo import cli  # noqa: E402
+from zelo import protocol as P  # noqa: E402
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 not installed")
+class GuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from zelo import gui
+        self.gui = gui
+        tmp = tempfile.mkdtemp()
+        cli.STATE_PATH = os.path.join(tmp, "state.json")
+        cli.BACKUP_DIR = os.path.join(tmp, "backups")
+        self.fake = FakeTransport()
+        self.fake.mem[0:P.CONFIG_LEN] = factory_image()
+        fake = self.fake
+
+        def run_sync(win, fn, on_done=None, busy=None):
+            res = fn(P.Mouse(fake))
+            if on_done:
+                on_done(res)
+
+        gui.MainWindow.run_device = run_sync
+        self.win = gui.MainWindow()
+        self.win.refresh()
+
+    def cfg(self):
+        return P.decode_config(bytes(self.fake.mem[:P.CONFIG_LEN]))
+
+    def test_buttons_loaded(self):
+        labels = [l.text() for l in self.win.buttons_tab.now_labels]
+        self.assertEqual(labels[2], "Левая кнопка")
+        self.assertEqual(labels[1], "DPI: по кругу")
+
+    def test_light_apply(self):
+        t = self.win.light_tab
+        t.mode.setCurrentIndex(t.mode.findData(cli.MODES["rainbow"]))
+        t.set_color([1, 2, 3])
+        t.speed.setValue(3)
+        t.light.setValue(4)
+        t.apply()
+        led = self.cfg()["led"]
+        self.assertEqual((led["mode"], led["color"], led["speed"], led["light"]), (2, [1, 2, 3], 3, 4))
+
+    def test_sensor_apply(self):
+        t = self.win.sensor_tab
+        t.count.setValue(3)
+        t.radios[1].setChecked(True)
+        t.combos[0].setCurrentIndex(t.combos[0].findData(400))
+        t.rate_24.setCurrentIndex(t.rate_24.findData(500))
+        t.apply()
+        c = self.cfg()
+        self.assertEqual((c["stages"], c["level"], c["dpi"][0]["dpi"]), (3, 1, 400))
+        self.assertEqual(P.decode_rate(c["rate_byte"])[0], 500)
+
+    def test_bind_through_dialog(self):
+        gui = self.gui
+
+        class FakeDialog:
+            def __init__(self, parent, slot, current):
+                pass
+
+            def exec(self):
+                from PySide6.QtWidgets import QDialog
+                return QDialog.DialogCode.Accepted
+
+            def action(self):
+                return "key:ctrl+shift+t"
+
+        gui.ActionDialog = FakeDialog
+        self.win.buttons_tab.edit(6)
+        e = self.cfg()["keys"][6]
+        self.assertEqual((e["type"], e["code"]), (4, 6))
+        self.assertEqual(self.win.buttons_tab.now_labels[6].text(), "Клавиши: ctrl+shift+t")
+
+
+if __name__ == "__main__":
+    unittest.main()
