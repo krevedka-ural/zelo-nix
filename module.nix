@@ -9,7 +9,7 @@ in
   options.programs.zelo = {
     enable = lib.mkEnableOption "zelo, the Zelotes F-36 CLI (package + udev rule)";
 
-    gui.enable = lib.mkEnableOption "the Qt GUI (zelo-gui; it also provides the zelo command)";
+    gui.enable = lib.mkEnableOption "the Qt GUI (zelo-gui); implies programs.zelo.enable and provides the zelo command too";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -26,7 +26,7 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf (cfg.enable || cfg.gui.enable) {
     # one package only: both ship a `zelo` binary and the same python module
     environment.systemPackages = [ (if cfg.gui.enable then cfg.guiPackage else cfg.package) ];
 
