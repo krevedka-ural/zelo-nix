@@ -8,7 +8,9 @@
     zelo info                    decode the main config block
     zelo rate [125|250|500] [--bt HZ]   polling rate
     zelo dpi [800 1200 ...] [--stage N] [--count N]   DPI stages
-    zelo keys                    show the button matrix (read-only for now)
+    zelo keys                    show what every button does
+    zelo bind 6 dpi-             rebind a button: left right middle back forward
+                                 dpi-loop dpi+ dpi- rgb none | key:ctrl+shift+t
     zelo restore FILE --yes      write back a backup made by zelo
     zelo dump -o backup.bin      hexdump / save mouse memory (read-only)
     zelo read 0x35 7             read raw bytes
@@ -112,7 +114,7 @@ def hexdump(data, base=0):
 def cmd_set(argv):
     ap = argparse.ArgumentParser(
         prog="zelo", description="Zelotes F-36 RGB panel color picker",
-        epilog="other commands: info dump read rate dpi keys restore")
+        epilog="other commands: info dump read rate dpi keys bind restore")
     ap.add_argument("-c", "--color", type=parse_color, metavar="COLOR",
                     help="red,green,blue,cyan,magenta,white,yellow,orange or #rrggbb")
     ap.add_argument("-m", "--mode", choices=MODES, metavar="MODE",
@@ -206,16 +208,23 @@ def fmt_rate(byte):
     return f"2.4G {f(g)}, BT {f(b)}  (byte 0x{byte:02x})"
 
 
-BUTTON_BITS = {0x01: "left", 0x02: "right", 0x04: "middle", 0x08: "back", 0x10: "forward"}
+BUTTON_BITS = {v: k for k, v in P.MOUSE_BUTTONS.items()}
+FUNC_NAMES = {v: k for k, v in P.FUNCTIONS.items()}
+
+
+def entry_name(k):
+    """Name of a matrix entry without reading the macro area."""
+    if k["type"] == P.TYPE_BUTTON and k["code"] in BUTTON_BITS:
+        return f"mouse {BUTTON_BITS[k['code']]}"
+    if (k["type"], k["code"]) in FUNC_NAMES:
+        return FUNC_NAMES[(k["type"], k["code"])]
+    if k["type"] == P.TYPE_MACRO:
+        return f"keyboard/macro (slot {k['code']})"
+    return "unknown"
 
 
 def fmt_key(k):
-    base = f"{k['type']:02x} {k['code']:02x} {k['param']:02x}"
-    if k["type"] == 0x01 and k["code"] in BUTTON_BITS:
-        return f"{base}  mouse button: {BUTTON_BITS[k['code']]}"
-    if k["type"] in (0x02, 0x05):
-        return f"{base}  function (DPI-related?)"
-    return base
+    return f"{k['type']:02x} {k['code']:02x} {k['param']:02x}  {entry_name(k)}"
 
 
 def fmt_dpi_slot(d):
@@ -271,14 +280,89 @@ def cmd_info(argv):
     print(hexdump(data))
 
 
+def describe_slot(mouse, i, k):
+    """Human description of slot i, reading the macro area for keyboard bindings."""
+    if k["type"] == P.TYPE_MACRO:
+        try:
+            dec = P.decode_key_macro(mouse.read_macro_header(k["code"]))
+        except P.ZeloError:
+            dec = None
+        return f"key:{P.format_keystroke(*dec)}" if dec else f"macro (slot {k['code']}, unknown format)"
+    return entry_name(k)
+
+
 def cmd_keys(argv):
-    ap = argparse.ArgumentParser(prog="zelo keys", description="show the button matrix")
+    ap = argparse.ArgumentParser(prog="zelo keys", description="show what every button does")
     ap.add_argument("-d", "--device", metavar="PATH")
     a = ap.parse_args(argv)
     with open_mouse(a.device) as m:
         _, c = read_cfg_or_die(m)
-    for i, k in enumerate(c["keys"]):
-        print(f"slot {i}: {fmt_key(k)}  chk {'ok' if k['ok'] else 'BAD'}")
+        for i, k in enumerate(c["keys"]):
+            ok = "" if k["ok"] else "  [checksum BAD]"
+            print(f"slot {i}: {describe_slot(m, i, k):<28} (factory: {P.FACTORY_SLOTS[i]}){ok}")
+
+
+# --- zelo bind --------------------------------------------------------------
+
+def parse_action(text):
+    """-> ('entry', (type, code, param)) or ('key', (mods, keys))"""
+    t = text.lower()
+    if t.startswith("key:"):
+        try:
+            return "key", P.parse_keystroke(t[4:])
+        except ValueError as e:
+            sys.exit(f"zelo: {e}")
+    if t in P.MOUSE_BUTTONS:
+        return "entry", (P.TYPE_BUTTON, P.MOUSE_BUTTONS[t], 0)
+    if t in P.FUNCTIONS:
+        return "entry", (*P.FUNCTIONS[t], 0)
+    sys.exit("zelo: unknown action '%s'. Use one of: %s, or key:<combo> (e.g. key:ctrl+shift+t)"
+             % (text, ", ".join(list(P.MOUSE_BUTTONS) + list(P.FUNCTIONS))))
+
+
+def cmd_bind(argv):
+    ap = argparse.ArgumentParser(prog="zelo bind", description="rebind a button")
+    ap.add_argument("slot", type=int, help="button slot 0..7 (see `zelo keys`)")
+    ap.add_argument("action", help="left right middle back forward dpi-loop dpi+ dpi- rgb none | key:<combo>")
+    ap.add_argument("--force", action="store_true", help="overwrite a macro in an unknown format")
+    add_common(ap)
+    a = ap.parse_args(argv)
+    if not 0 <= a.slot < P.KEY_SLOTS:
+        sys.exit(f"zelo: slot must be 0..{P.KEY_SLOTS - 1}")
+    kind, spec = parse_action(a.action)
+
+    with open_mouse(a.device) as m:
+        _, c = read_cfg_or_die(m)
+        cur = c["keys"][a.slot]
+        if not cur["ok"]:
+            sys.exit("zelo: this slot failed its checksum, refusing to write")
+        if cur["type"] == P.TYPE_MACRO and not a.force:
+            try:
+                known = P.decode_key_macro(m.read_macro_header(cur["code"])) is not None
+            except P.ZeloError as e:
+                sys.exit(f"zelo: {e}")
+            if not known:
+                sys.exit("zelo: this slot holds a macro zelo can't decode; use --force to overwrite it")
+
+        def apply():
+            if kind == "key":
+                ok = m.write_key_macro(a.slot, *spec, wait=a.wait)
+                return m.write_key(a.slot, P.TYPE_MACRO, a.slot, 1, wait=a.wait) and ok
+            return m.write_key(a.slot, *spec, wait=a.wait)
+
+        safe_write(m, f"slot {a.slot} -> {a.action}", apply, a.wait, a.verbose)
+
+        # read back and compare (writes to a sleeping mouse may not have arrived yet)
+        try:
+            _, c2 = read_cfg_or_die(m)
+            now = c2["keys"][a.slot]
+            ok = now["ok"] and (now["type"], now["code"]) == (
+                (P.TYPE_MACRO, a.slot) if kind == "key" else spec[:2])
+            if ok and kind == "key":
+                ok = P.decode_key_macro(m.read_macro_header(a.slot)) == (spec[0], list(spec[1]))
+        except P.ZeloError:
+            ok = False
+        print("verified: " + ("yes" if ok else "NO - read-back differs (mouse asleep? try again with -w 10)"))
 
 
 # --- zelo rate --------------------------------------------------------------
@@ -413,7 +497,7 @@ def cmd_read(argv):
 
 
 COMMANDS = {"info": cmd_info, "dump": cmd_dump, "read": cmd_read, "rate": cmd_rate,
-            "dpi": cmd_dpi, "keys": cmd_keys, "restore": cmd_restore}
+            "dpi": cmd_dpi, "keys": cmd_keys, "bind": cmd_bind, "restore": cmd_restore}
 
 
 def main(argv=None):

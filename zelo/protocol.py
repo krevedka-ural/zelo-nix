@@ -25,7 +25,15 @@ Memory map (confirmed by the driver's own debug strings):
     0x06..0x14 DPI stages, 5 x [X, Y, chk]     (X/Y = sensor code, see SENSOR_DPI)
     0x15..0x34 key matrix, 8 x [type, code, param, chk]
     0x35..0x3b LED block: mode, R, G, B, speed, light, checksum
-    0x200+     macros, 0x180 bytes per slot
+    0x200+     macro slots, 0x180 bytes each (slot n at 0x200 + n*0x180); a keyboard
+               binding is a matrix entry [04, n, 01] pointing at macro slot n:
+                 +0x00..0x1c  name area (zeros)
+                 +0x1d        0x52, +0x1e 0x03   (keystroke macro header)
+                 +0x1f        event count n
+                 +0x20        n events x 4 bytes [op, d1, d2, 0x0f]
+                              op 0x80/0x40 modifier down/up (d1 = HID modifier bit)
+                                 0x81/0x41 key down/up      (d1 = HID usage)
+                 then 1 checksum byte over (count + events)
 Every record ends with chk = (0x55 - sum(record bytes)) & 0xff.
 
 Transport is plain /dev/hidrawN + ioctl(HIDIOCSFEATURE), stdlib only.
@@ -68,6 +76,57 @@ SENSOR_DPI = {
     2200: 0x3A, 2300: 0x3C, 2400: 0x3F,
 }
 DPI_FROM_CODE = {v: k for k, v in SENSOR_DPI.items()}
+
+# --- buttons / functions (matrix entries) ---------------------------------------
+
+MOUSE_BUTTONS = {"left": 0x01, "right": 0x02, "middle": 0x04, "back": 0x08, "forward": 0x10}
+FUNCTIONS = {                     # name -> (type, code)
+    "none": (0x00, 0x00),
+    "dpi-loop": (0x02, 0x01),
+    "dpi+": (0x02, 0x02),
+    "dpi-": (0x02, 0x03),
+    "rgb": (0x05, 0x00),
+}
+TYPE_BUTTON, TYPE_MACRO = 0x01, 0x04
+FACTORY_SLOTS = {0: "middle", 1: "dpi-loop", 2: "left", 3: "right",
+                 4: "rgb", 5: "back", 6: "none", 7: "forward"}   # from the vendor Cfg.ini
+
+ADDR_MACRO = 0x200
+MACRO_SIZE = 0x180
+MACRO_HDR = 0x1D          # marker offset inside a slot
+KEY_MACRO_MARK = (0x52, 0x03)
+
+MODIFIERS = {"ctrl": 0x01, "shift": 0x02, "alt": 0x04, "win": 0x08, "super": 0x08, "gui": 0x08}
+_MOD_DOWN_ORDER = (0x01, 0x02, 0x08, 0x04)   # the driver's order
+_MOD_UP_ORDER = (0x04, 0x08, 0x02, 0x01)
+
+# USB HID keyboard usages the vendor driver accepts (from its 104-entry table)
+DRIVER_USAGES = frozenset(
+    list(range(0x04, 0x28)) + [0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31,
+                               0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39]
+    + list(range(0x3A, 0x46)) + list(range(0x46, 0x4F)) + list(range(0x4F, 0x53))
+    + list(range(0x53, 0x64)) + [0x65] + list(range(0xE0, 0xE8)))
+
+KEYS = {}
+for _i, _c in enumerate("abcdefghijklmnopqrstuvwxyz"):
+    KEYS[_c] = 0x04 + _i
+for _i, _c in enumerate("1234567890"):
+    KEYS[_c] = 0x1E + _i
+for _i in range(12):
+    KEYS[f"f{_i + 1}"] = 0x3A + _i
+for _i in range(9):
+    KEYS[f"kp{_i + 1}"] = 0x59 + _i
+KEYS.update({
+    "enter": 0x28, "esc": 0x29, "backspace": 0x2A, "tab": 0x2B, "space": 0x2C,
+    "minus": 0x2D, "equal": 0x2E, "lbracket": 0x2F, "rbracket": 0x30, "backslash": 0x31,
+    "semicolon": 0x33, "quote": 0x34, "grave": 0x35, "comma": 0x36, "period": 0x37,
+    "slash": 0x38, "capslock": 0x39, "printscreen": 0x46, "scrolllock": 0x47,
+    "pause": 0x48, "insert": 0x49, "home": 0x4A, "pageup": 0x4B, "delete": 0x4C,
+    "end": 0x4D, "pagedown": 0x4E, "arrow-right": 0x4F, "arrow-left": 0x50,
+    "arrow-down": 0x51, "arrow-up": 0x52, "numlock": 0x53, "kp/": 0x54, "kp*": 0x55,
+    "kp-": 0x56, "kp+": 0x57, "kpenter": 0x58, "kp0": 0x62, "kp.": 0x63, "menu": 0x65,
+})
+KEY_NAMES = {v: k for k, v in KEYS.items()}
 
 
 class ZeloError(Exception):
@@ -181,6 +240,60 @@ def config_is_sane(data):
     return (c["rate_byte"] is not None and c["stages"] is not None and c["level"] is not None
             and all(d["ok"] for d in c["dpi"]) and all(k["ok"] for k in c["keys"])
             and c["led"] is not None)
+
+
+# --- keyboard macros ----------------------------------------------------------
+
+def parse_keystroke(text):
+    """'ctrl+shift+t' -> (modifier_mask, [usage, ...]); at most 3 non-modifier keys."""
+    mods, keys = 0, []
+    for part in text.lower().split("+"):
+        part = part.strip()
+        if part in MODIFIERS:
+            mods |= MODIFIERS[part]
+        elif part in KEYS:
+            keys.append(KEYS[part])
+        else:
+            raise ValueError(f"unknown key '{part}'")
+    if len(keys) > 3:
+        raise ValueError("at most 3 keys besides modifiers")
+    if not keys and not mods:
+        raise ValueError("empty keystroke")
+    return mods, keys
+
+
+def format_keystroke(mods, keys):
+    names = [n for n, b in (("ctrl", 1), ("shift", 2), ("alt", 4), ("win", 8)) if mods & b]
+    return "+".join(names + [KEY_NAMES.get(k, f"0x{k:02x}") for k in keys])
+
+
+def build_key_macro(mods, keys):
+    """Full slot image (from slot offset 0) for a keystroke, exactly as the driver builds it."""
+    ev = [(0x80, b) for b in _MOD_DOWN_ORDER if mods & b]
+    ev += [(0x81, k) for k in keys]
+    ev += [(0x41, k) for k in reversed(keys)]
+    ev += [(0x40, b) for b in _MOD_UP_ORDER if mods & b]
+    body = bytes([len(ev)]) + b"".join(bytes([op, d, 0, 0x0F]) for op, d in ev)
+    body += bytes([checksum(body)])
+    return bytes(MACRO_HDR) + bytes(KEY_MACRO_MARK) + body
+
+
+def decode_key_macro(raw):
+    """raw = slot bytes starting at the marker (offset 0x1d). -> (mods, keys) or None."""
+    if len(raw) < 4 or tuple(raw[:2]) != KEY_MACRO_MARK:
+        return None
+    n = raw[2]
+    end = 3 + 4 * n
+    if len(raw) < end + 1 or checksum(raw[2:end]) != raw[end]:
+        return None
+    mods, keys = 0, []
+    for i in range(n):
+        op, d = raw[3 + 4 * i], raw[4 + 4 * i]
+        if op == 0x80:
+            mods |= d
+        elif op == 0x81:
+            keys.append(d)
+    return mods, keys
 
 
 # --- transport --------------------------------------------------------------
@@ -354,3 +467,15 @@ class Mouse:
 
     def write_key(self, slot, kind, code, param=0, **kw):
         return self.write(ADDR_KEYS + 4 * slot, encode_key(kind, code, param), **kw)
+
+    def read_macro_header(self, slot):
+        """Bytes from the marker on: header (3) + events + checksum, or b'' if empty."""
+        base = ADDR_MACRO + slot * MACRO_SIZE + MACRO_HDR
+        hdr = self.read(base, 3)
+        if hdr[0] == 0:
+            return b""
+        n = min(hdr[2], 32)
+        return hdr + self.read(base + 3, 4 * n + 1)
+
+    def write_key_macro(self, slot, mods, keys, **kw):
+        return self.write(ADDR_MACRO + slot * MACRO_SIZE, build_key_macro(mods, keys), **kw)

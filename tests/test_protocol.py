@@ -11,7 +11,7 @@ class FakeTransport:
 
     def __init__(self, with_id=True, answer=True, asleep_for=0):
         self.asleep_for = asleep_for  # first N feature reports get no answer and no effect
-        self.mem = bytearray(0x400)
+        self.mem = bytearray(0x1000)
         self.q = []
         self.with_id = with_id
         self.answer = answer
@@ -233,7 +233,7 @@ class CliTests(unittest.TestCase):
         before = bytes(self.fake.mem)
         out = self.run_cli("info")
         self.assertIn("stage 3: 1600 DPI", out)
-        self.assertIn("slot 5: 01 08 00  mouse button: back", out)
+        self.assertIn("slot 5: 01 08 00  mouse back", out)
         self.run_cli("keys")
         self.assertEqual(bytes(self.fake.mem), before)
 
@@ -249,12 +249,97 @@ class CliTests(unittest.TestCase):
 
     def test_keys_names(self):
         out = self.run_cli("keys")
-        self.assertIn("mouse button: left", out)
+        self.assertIn("slot 2: mouse left", out)
+        self.assertIn("slot 1: dpi-loop", out)
+        self.assertIn("slot 4: rgb", out)
 
     def test_led_uses_mouse_state(self):
         self.run_cli("-c", "blue")
         led = self.cfg()["led"]
         self.assertEqual((led["mode"], led["color"]), (1, [0, 0, 255]))
+
+
+class KeyMacroTests(unittest.TestCase):
+    def test_all_named_keys_are_driver_supported(self):
+        self.assertTrue(all(u in P.DRIVER_USAGES for u in P.KEYS.values()))
+
+    def test_parse_and_format(self):
+        mods, keys = P.parse_keystroke("Ctrl+Shift+T")
+        self.assertEqual((mods, keys), (3, [P.KEYS["t"]]))
+        self.assertEqual(P.format_keystroke(mods, keys), "ctrl+shift+t")
+        for bad in ("", "ctrl+", "foo", "a+b+c+d"):
+            with self.assertRaises(ValueError):
+                P.parse_keystroke(bad)
+
+    def test_macro_layout_matches_driver(self):
+        img = P.build_key_macro(*P.parse_keystroke("ctrl+shift+a"))
+        self.assertEqual(img[:0x1D], bytes(0x1D))
+        self.assertEqual(img[0x1D:0x1F], b"\x52\x03")
+        self.assertEqual(img[0x1F], 6)  # 2 mod down, key down, key up, 2 mod up
+        ev = [tuple(img[0x20 + 4 * i:0x24 + 4 * i]) for i in range(6)]
+        self.assertEqual(ev, [(0x80, 1, 0, 15), (0x80, 2, 0, 15), (0x81, 4, 0, 15),
+                              (0x41, 4, 0, 15), (0x40, 2, 0, 15), (0x40, 1, 0, 15)])
+        self.assertEqual(img[-1], P.checksum(img[0x1F:-1]))
+        self.assertEqual(len(img), 0x1F + 1 + 4 * 6 + 1)
+
+    def test_single_key_length_matches_driver(self):
+        # driver: total = 4*n + 0x21 for n events
+        self.assertEqual(len(P.build_key_macro(0, [P.KEYS["a"]])), 4 * 2 + 0x21)
+
+    def test_decode_roundtrip_and_corruption(self):
+        img = P.build_key_macro(*P.parse_keystroke("alt+f4"))
+        self.assertEqual(P.decode_key_macro(img[0x1D:]), (4, [P.KEYS["f4"]]))
+        bad = bytearray(img)
+        bad[0x22] ^= 1
+        self.assertIsNone(P.decode_key_macro(bytes(bad[0x1D:])))
+        self.assertIsNone(P.decode_key_macro(bytes(8)))
+
+
+class BindTests(CliTests):
+    def entry(self, slot):
+        return self.cfg()["keys"][slot]
+
+    def test_bind_function_and_button(self):
+        out = self.run_cli("bind", "6", "dpi-")
+        self.assertIn("verified: yes", out)
+        e = self.entry(6)
+        self.assertEqual((e["type"], e["code"], e["ok"]), (2, 3, True))
+        self.run_cli("bind", "0", "back")
+        self.assertEqual((self.entry(0)["type"], self.entry(0)["code"]), (1, 0x08))
+        self.run_cli("bind", "4", "none")
+        self.assertEqual((self.entry(4)["type"], self.entry(4)["code"]), (0, 0))
+
+    def test_bind_keystroke(self):
+        out = self.run_cli("bind", "6", "key:ctrl+shift+t")
+        self.assertIn("verified: yes", out)
+        e = self.entry(6)
+        self.assertEqual((e["type"], e["code"], e["param"], e["ok"]), (4, 6, 1, True))
+        base = 0x200 + 6 * 0x180
+        self.assertEqual(bytes(self.fake.mem[base + 0x1D:base + 0x1F]), b"\x52\x03")
+        self.assertIn("slot 6: key:ctrl+shift+t", self.run_cli("keys"))
+
+    def test_rebind_over_known_macro_is_fine_unknown_needs_force(self):
+        self.run_cli("bind", "6", "key:a")
+        self.run_cli("bind", "6", "key:b")  # decodable -> ok
+        self.assertIn("key:b", self.run_cli("keys"))
+        # corrupt the macro -> unknown format
+        base = 0x200 + 6 * 0x180
+        self.fake.mem[base + 0x20] ^= 0xFF
+        with self.assertRaises(SystemExit):
+            self.run_cli("bind", "6", "left")
+        self.run_cli("bind", "6", "left", "--force")
+        self.assertEqual(self.entry(6)["type"], 1)
+
+    def test_bad_input(self):
+        for args in (("bind", "9", "left"), ("bind", "1", "fly"), ("bind", "1", "key:ctrl+nope")):
+            with self.assertRaises(SystemExit):
+                self.run_cli(*args)
+
+    def test_backup_made_before_bind(self):
+        self.run_cli("bind", "6", "dpi-")
+        files = os.listdir(self.cli.BACKUP_DIR)
+        with open(os.path.join(self.cli.BACKUP_DIR, files[0]), "rb") as f:
+            self.assertEqual(f.read(), factory_image())
 
 
 if __name__ == "__main__":
