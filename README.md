@@ -26,3 +26,5 @@ programs.zelo.enable = true;
 ```
 
 Packet format and how it was found: see the header of `zelo`.
+
+# THIS IS FULL-VIBECODED PROJECT!!!
