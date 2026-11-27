@@ -12,9 +12,10 @@ Every tab has `load(snapshot)` (fill widgets from the mouse) and an apply button
 import itertools
 import sys
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -45,6 +46,19 @@ ACTIONS = [  # (label, action string understood by api.bind)
     ("Сочетание клавиш…", "key"),
 ]
 ACTION_LABEL = {act: label for label, act in ACTIONS}
+ACTION_LABEL["bt-switch"] = "Переключение BT / 2.4G"
+
+# Buttons are numbered like in the vendor picture (zelo/assets/mouse.png)
+BUTTON_TITLES = {
+    1: "Левая кнопка мыши",
+    2: "Правая кнопка мыши",
+    3: "Кнопка на колесе",
+    4: "Боковая кнопка: вперёд",
+    5: "Боковая кнопка: назад",
+    6: "DPI",
+    7: "Дополнительная: переключение подсветки",
+    8: "Переключатель BT / 2.4G",
+}
 
 MODE_CHOICES = [  # (label, zelo mode name); order of modes is inferred from the driver
     ("Статичный", "static"),
@@ -55,6 +69,17 @@ MODE_CHOICES = [  # (label, zelo mode name); order of modes is inferred from the
 ]
 
 COLOR_PRESETS = [(n, c) for n, c in cli.COLORS.items() if n != "yelow"]
+
+
+def mouse_pixmap():
+    """The vendor picture with numbered buttons, if present (optional)."""
+    for path in (Path(__file__).parent / "assets" / "mouse.png",
+                 Path.home() / ".config" / "zelo" / "mouse.png"):
+        if path.is_file():
+            pm = QPixmap(str(path))
+            if not pm.isNull():
+                return pm
+    return None
 
 
 def action_text(action, raw):
@@ -163,11 +188,11 @@ class KeyCapture(QLineEdit):
 
 
 class ActionDialog(QDialog):
-    def __init__(self, parent, slot, current):
+    def __init__(self, parent, button, title, current):
         super().__init__(parent)
-        self.setWindowTitle(f"Слот {slot}")
+        self.setWindowTitle(f"Кнопка {button}")
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Что должна делать эта кнопка?"))
+        lay.addWidget(QLabel(f"{title}: что она должна делать?"))
 
         self.combo = QComboBox()
         for label, act in ACTIONS:
@@ -218,44 +243,61 @@ class ButtonsTab(QWidget):
     def __init__(self, win):
         super().__init__()
         self.win = win
-        self.slots = []
-        outer = QVBoxLayout(self)
-        outer.addWidget(QLabel(
-            "Слоты — это кнопки мыши в порядке памяти; как они расположены на корпусе, "
-            "лучше проверить опытом. «По умолчанию» — заводское назначение слота."))
+        self.buttons = []
+        outer = QHBoxLayout(self)
+
+        pm = mouse_pixmap()
+        if pm is not None:
+            pic = QLabel()
+            pic.setPixmap(pm.scaledToHeight(380, Qt.TransformationMode.SmoothTransformation))
+            pic.setAlignment(Qt.AlignmentFlag.AlignTop)
+            outer.addWidget(pic)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Номера — как на картинке. «По умолчанию» — заводское назначение."))
         grid = QGridLayout()
-        for col, title in enumerate(("Слот", "По умолчанию", "Сейчас", "")):
-            lbl = QLabel(f"<b>{title}</b>")
-            grid.addWidget(lbl, 0, col)
-        self.now_labels = []
-        for i in range(P.KEY_SLOTS):
-            grid.addWidget(QLabel(str(i)), i + 1, 0)
-            factory = ACTION_LABEL.get(P.FACTORY_SLOTS[i], P.FACTORY_SLOTS[i])
-            grid.addWidget(QLabel(factory), i + 1, 1)
+        for col, title in enumerate(("№", "Кнопка", "По умолчанию", "Сейчас", "")):
+            grid.addWidget(QLabel(f"<b>{title}</b>"), 0, col)
+        self.now_labels = []   # index = button number - 1
+        self.edit_buttons = []
+        for n in range(1, P.KEY_SLOTS + 1):
+            grid.addWidget(QLabel(str(n)), n, 0)
+            grid.addWidget(QLabel(BUTTON_TITLES[n]), n, 1)
+            factory = P.BUTTON_FACTORY[n]
+            grid.addWidget(QLabel(ACTION_LABEL.get(factory, factory)), n, 2)
             now = QLabel("—")
             self.now_labels.append(now)
-            grid.addWidget(now, i + 1, 2)
+            grid.addWidget(now, n, 3)
             btn = QPushButton("Изменить…")
-            btn.clicked.connect(lambda _=False, n=i: self.edit(n))
-            grid.addWidget(btn, i + 1, 3)
-        grid.setColumnStretch(2, 1)
-        outer.addLayout(grid)
-        outer.addStretch(1)
+            if n == P.BT_SWITCH_BUTTON:
+                btn.setEnabled(False)
+                btn.setToolTip("Эту кнопку обрабатывает прошивка мыши, переназначить её нельзя")
+            else:
+                btn.clicked.connect(lambda _=False, b=n: self.edit(b))
+            self.edit_buttons.append(btn)
+            grid.addWidget(btn, n, 4)
+        grid.setColumnStretch(3, 1)
+        right.addLayout(grid)
+        right.addStretch(1)
+        outer.addLayout(right, 1)
 
     def load(self, snap):
-        self.slots = snap["slots"]
-        for s in self.slots:
-            self.now_labels[s["slot"]].setText(action_text(s["action"], s["raw"]))
+        self.buttons = snap["buttons"]
+        for b in self.buttons:
+            self.now_labels[b["button"] - 1].setText(action_text(b["action"], b["raw"]))
 
-    def edit(self, slot):
-        current = self.slots[slot]["action"] if self.slots else None
-        dlg = ActionDialog(self, slot, current)
+    def edit(self, button):
+        current = None
+        for b in self.buttons:
+            if b["button"] == button:
+                current = b["action"]
+        dlg = ActionDialog(self, button, BUTTON_TITLES[button], current)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         action = dlg.action()
         wait = self.win.wait_seconds()
-        self.win.run_device(lambda m: [api.bind(m, slot, action, wait=wait)],
-                            self.win.after_write, busy=f"Записываю слот {slot}…")
+        self.win.run_device(lambda m: [api.bind_button(m, button, action, wait=wait)],
+                            self.win.after_write, busy=f"Записываю кнопку {button}…")
 
 
 class SensorTab(QWidget):

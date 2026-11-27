@@ -88,8 +88,16 @@ FUNCTIONS = {                     # name -> (type, code)
     "rgb": (0x05, 0x00),
 }
 TYPE_BUTTON, TYPE_MACRO = 0x01, 0x04
-FACTORY_SLOTS = {0: "middle", 1: "dpi-loop", 2: "left", 3: "right",
-                 4: "rgb", 5: "back", 6: "none", 7: "forward"}   # from the vendor Cfg.ini
+
+# Physical buttons as numbered in the vendor's picture (and Cfg.ini K1..K8) -> matrix slot.
+# Slot = (id from Cfg.ini) - 1, cross-checked against a real memory dump.
+BUTTON_SLOT = {1: 2, 2: 3, 3: 0, 4: 7, 5: 5, 6: 1, 7: 4, 8: 6}
+BUTTON_FACTORY = {1: "left", 2: "right", 3: "middle", 4: "forward", 5: "back",
+                  6: "dpi-loop", 7: "rgb", 8: "bt-switch"}
+SLOT_BUTTON = {slot: btn for btn, slot in BUTTON_SLOT.items()}
+FACTORY_SLOTS = {BUTTON_SLOT[b]: act for b, act in BUTTON_FACTORY.items()}
+BT_SWITCH_BUTTON = 8      # BT <-> 2.4G switch: handled by the firmware, not rebindable
+BT_SWITCH_SLOT = BUTTON_SLOT[BT_SWITCH_BUTTON]
 
 ADDR_MACRO = 0x200
 MACRO_SIZE = 0x180

@@ -19,3 +19,6 @@ zelo-gui = "zelo.gui:main"
 
 [tool.setuptools]
 packages = ["zelo"]
+
+[tool.setuptools.package-data]
+zelo = ["assets/*.png"]

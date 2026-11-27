@@ -21,13 +21,17 @@ class ApiTests(unittest.TestCase):
 
     def test_snapshot(self):
         s = api.snapshot(self.m)
-        acts = [x["action"] for x in s["slots"]]
-        self.assertEqual(acts, ["middle", "dpi-loop", "left", "right", "rgb", "back", "dpi+", "forward"])
+        acts = [x["action"] for x in s["slots"]]  # memory order; slot 6 is the BT/2.4G switch
+        self.assertEqual(acts, ["middle", "dpi-loop", "left", "right", "rgb", "back", "bt-switch", "forward"])
+        by_button = [x["action"] for x in s["buttons"]]  # vendor picture order 1..8
+        self.assertEqual(by_button, ["left", "right", "middle", "forward", "back", "dpi-loop", "rgb", "bt-switch"])
+        self.assertEqual([x["button"] for x in s["buttons"]], list(range(1, 9)))
+        self.assertEqual([x["locked"] for x in s["buttons"]], [False] * 7 + [True])
         self.assertEqual(s["cfg"]["stages"], 5)
 
     def test_snapshot_reads_key_macro(self):
-        api.bind(self.m, 6, "key:ctrl+shift+t")
-        self.assertEqual(api.snapshot(self.m)["slots"][6]["action"], "key:ctrl+shift+t")
+        api.bind(self.m, 3, "key:ctrl+shift+t")
+        self.assertEqual(api.snapshot(self.m)["slots"][3]["action"], "key:ctrl+shift+t")
 
     def test_set_led(self):
         r = api.set_led(self.m, 2, [10, 20, 30], 3, 4)
@@ -64,6 +68,19 @@ class ApiTests(unittest.TestCase):
             api.bind(self.m, 8, "left")
         with self.assertRaises(ValueError):
             api.bind(self.m, 1, "key:ctrl+nope")
+
+    def test_bt_switch_is_protected(self):
+        with self.assertRaises(P.ZeloError):
+            api.bind(self.m, 6, "left")
+        with self.assertRaises(P.ZeloError):
+            api.bind_button(self.m, 8, "left")
+        self.assertEqual(self.m.read(0x15 + 4 * 6, 3), bytes([2, 2, 0]))  # untouched
+
+    def test_bind_button_uses_picture_numbers(self):
+        self.assertTrue(api.bind_button(self.m, 6, "dpi-")["verified"])      # button 6 = DPI button = slot 1
+        self.assertEqual(api.snapshot(self.m)["buttons"][5]["action"], "dpi-")
+        with self.assertRaises(ValueError):
+            api.bind_button(self.m, 9, "left")
 
     def test_summarize(self):
         ok = {"acked": True, "verified": True, "changed": True, "backup": None}

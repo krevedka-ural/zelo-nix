@@ -54,9 +54,12 @@ class GuiTests(unittest.TestCase):
         return P.decode_config(bytes(self.fake.mem[:P.CONFIG_LEN]))
 
     def test_buttons_loaded(self):
-        labels = [l.text() for l in self.win.buttons_tab.now_labels]
-        self.assertEqual(labels[2], "Левая кнопка")
-        self.assertEqual(labels[1], "DPI: по кругу")
+        labels = [l.text() for l in self.win.buttons_tab.now_labels]  # index = button number - 1
+        self.assertEqual(labels[0], "Левая кнопка")
+        self.assertEqual(labels[2], "Средняя кнопка")
+        self.assertEqual(labels[5], "DPI: по кругу")
+        self.assertEqual(labels[7], "Переключение BT / 2.4G")
+        self.assertFalse(self.win.buttons_tab.edit_buttons[7].isEnabled())
 
     def test_light_apply(self):
         t = self.win.light_tab
@@ -83,8 +86,8 @@ class GuiTests(unittest.TestCase):
         gui = self.gui
 
         class FakeDialog:
-            def __init__(self, parent, slot, current):
-                pass
+            def __init__(self, parent, button, title, current):
+                self.args = (button, title, current)
 
             def exec(self):
                 from PySide6.QtWidgets import QDialog
@@ -94,10 +97,10 @@ class GuiTests(unittest.TestCase):
                 return "key:ctrl+shift+t"
 
         gui.ActionDialog = FakeDialog
-        self.win.buttons_tab.edit(6)
-        e = self.cfg()["keys"][6]
-        self.assertEqual((e["type"], e["code"]), (4, 6))
-        self.assertEqual(self.win.buttons_tab.now_labels[6].text(), "Клавиши: ctrl+shift+t")
+        self.win.buttons_tab.edit(2)          # button 2 = right button = memory slot 3
+        e = self.cfg()["keys"][3]
+        self.assertEqual((e["type"], e["code"]), (4, 3))
+        self.assertEqual(self.win.buttons_tab.now_labels[1].text(), "Клавиши: ctrl+shift+t")
 
 
 if __name__ == "__main__":

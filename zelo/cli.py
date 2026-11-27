@@ -8,9 +8,10 @@
     zelo info                    decode the main config block
     zelo rate [125|250|500] [--bt HZ]   polling rate
     zelo dpi [800 1200 ...] [--stage N] [--count N]   DPI stages
-    zelo keys                    show what every button does
-    zelo bind 6 dpi-             rebind a button: left right middle back forward
+    zelo keys                    show what every button does (numbers as in the vendor picture)
+    zelo bind 6 dpi-             rebind button 6: left right middle back forward
                                  dpi-loop dpi+ dpi- rgb none | key:ctrl+shift+t
+                                 (button 8 = BT/2.4G switch, cannot be rebound)
     zelo restore FILE --yes      write back a backup made by zelo
     zelo dump -o backup.bin      hexdump / save mouse memory (read-only)
     zelo read 0x35 7             read raw bytes
@@ -275,13 +276,19 @@ def cmd_info(argv):
     print(f"LED:          {fmt_state(c['led'])}" if c["led"] else "LED:          checksum MISMATCH")
     print("buttons (key matrix, slot: type code param):")
     for i, k in enumerate(c["keys"]):
-        print(f"  slot {i}: {fmt_key(k)}  chk {'ok' if k['ok'] else 'BAD'}")
+        print(f"  slot {i}: {fmt_key(k)}  chk {'ok' if k['ok'] else 'BAD'}  [button {P.SLOT_BUTTON[i]}]")
     print("\nraw 0x00..0x3b:")
     print(hexdump(data))
 
 
+BUTTON_NAMES = {1: "left button", 2: "right button", 3: "wheel button", 4: "side: forward",
+                5: "side: back", 6: "DPI", 7: "extra: lighting", 8: "BT/2.4G switch"}
+
+
 def describe_slot(mouse, i, k):
     """Human description of slot i, reading the macro area for keyboard bindings."""
+    if i == P.BT_SWITCH_SLOT:
+        return "BT / 2.4G switch (fixed)"
     if k["type"] == P.TYPE_MACRO:
         try:
             dec = P.decode_key_macro(mouse.read_macro_header(k["code"]))
@@ -297,72 +304,46 @@ def cmd_keys(argv):
     a = ap.parse_args(argv)
     with open_mouse(a.device) as m:
         _, c = read_cfg_or_die(m)
-        for i, k in enumerate(c["keys"]):
+        for b in sorted(P.BUTTON_SLOT):
+            i = P.BUTTON_SLOT[b]
+            k = c["keys"][i]
             ok = "" if k["ok"] else "  [checksum BAD]"
-            print(f"slot {i}: {describe_slot(m, i, k):<28} (factory: {P.FACTORY_SLOTS[i]}){ok}")
+            print(f"{b}  {BUTTON_NAMES[b]:<17} {describe_slot(m, i, k):<26} "
+                  f"(factory: {P.BUTTON_FACTORY[b]}){ok}")
 
 
 # --- zelo bind --------------------------------------------------------------
 
-def parse_action(text):
-    """-> ('entry', (type, code, param)) or ('key', (mods, keys))"""
-    t = text.lower()
-    if t.startswith("key:"):
-        try:
-            return "key", P.parse_keystroke(t[4:])
-        except ValueError as e:
-            sys.exit(f"zelo: {e}")
-    if t in P.MOUSE_BUTTONS:
-        return "entry", (P.TYPE_BUTTON, P.MOUSE_BUTTONS[t], 0)
-    if t in P.FUNCTIONS:
-        return "entry", (*P.FUNCTIONS[t], 0)
-    sys.exit("zelo: unknown action '%s'. Use one of: %s, or key:<combo> (e.g. key:ctrl+shift+t)"
-             % (text, ", ".join(list(P.MOUSE_BUTTONS) + list(P.FUNCTIONS))))
-
-
 def cmd_bind(argv):
+    from . import api  # imported here: api itself imports this module
     ap = argparse.ArgumentParser(prog="zelo bind", description="rebind a button")
-    ap.add_argument("slot", type=int, help="button slot 0..7 (see `zelo keys`)")
+    ap.add_argument("button", type=int, help="button number 1..8 as in the vendor picture (see `zelo keys`)")
     ap.add_argument("action", help="left right middle back forward dpi-loop dpi+ dpi- rgb none | key:<combo>")
-    ap.add_argument("--force", action="store_true", help="overwrite a macro in an unknown format")
+    ap.add_argument("--slot", dest="raw", action="store_true",
+                    help="treat the number as a raw memory slot 0..7 instead of a button number")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite a macro in an unknown format / the BT-2.4G switch slot")
     add_common(ap)
     a = ap.parse_args(argv)
-    if not 0 <= a.slot < P.KEY_SLOTS:
-        sys.exit(f"zelo: slot must be 0..{P.KEY_SLOTS - 1}")
-    kind, spec = parse_action(a.action)
+
+    if a.raw:
+        slot = a.button
+    else:
+        slot = P.BUTTON_SLOT.get(a.button)
+    if slot is None or not 0 <= slot < P.KEY_SLOTS:
+        sys.exit("zelo: button must be 1..8" if not a.raw else "zelo: slot must be 0..7")
 
     with open_mouse(a.device) as m:
-        _, c = read_cfg_or_die(m)
-        cur = c["keys"][a.slot]
-        if not cur["ok"]:
-            sys.exit("zelo: this slot failed its checksum, refusing to write")
-        if cur["type"] == P.TYPE_MACRO and not a.force:
-            try:
-                known = P.decode_key_macro(m.read_macro_header(cur["code"])) is not None
-            except P.ZeloError as e:
-                sys.exit(f"zelo: {e}")
-            if not known:
-                sys.exit("zelo: this slot holds a macro zelo can't decode; use --force to overwrite it")
-
-        def apply():
-            if kind == "key":
-                ok = m.write_key_macro(a.slot, *spec, wait=a.wait)
-                return m.write_key(a.slot, P.TYPE_MACRO, a.slot, 1, wait=a.wait) and ok
-            return m.write_key(a.slot, *spec, wait=a.wait)
-
-        safe_write(m, f"slot {a.slot} -> {a.action}", apply, a.wait, a.verbose)
-
-        # read back and compare (writes to a sleeping mouse may not have arrived yet)
         try:
-            _, c2 = read_cfg_or_die(m)
-            now = c2["keys"][a.slot]
-            ok = now["ok"] and (now["type"], now["code"]) == (
-                (P.TYPE_MACRO, a.slot) if kind == "key" else spec[:2])
-            if ok and kind == "key":
-                ok = P.decode_key_macro(m.read_macro_header(a.slot)) == (spec[0], list(spec[1]))
-        except P.ZeloError:
-            ok = False
-        print("verified: " + ("yes" if ok else "NO - read-back differs (mouse asleep? try again with -w 10)"))
+            res = api.bind(m, slot, a.action, wait=a.wait, force=a.force)
+        except (ValueError, P.ZeloError) as e:
+            sys.exit(f"zelo: {e}")
+    what = f"slot {slot}" if a.raw else f"button {a.button}"
+    print(f"{what} -> {a.action}  (backup: {res['backup']})")
+    if not res["acked"] and (a.verbose or a.wait > 0):
+        print(ASLEEP_HINT, file=sys.stderr)
+    print("verified: " + ("yes" if res["verified"]
+                          else "NO - read-back differs (mouse asleep? try again with -w 10)"))
 
 
 # --- zelo rate --------------------------------------------------------------

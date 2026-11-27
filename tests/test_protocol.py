@@ -248,10 +248,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.cfg()["led"]["color"], [0, 255, 0])
 
     def test_keys_names(self):
-        out = self.run_cli("keys")
-        self.assertIn("slot 2: mouse left", out)
-        self.assertIn("slot 1: dpi-loop", out)
-        self.assertIn("slot 4: rgb", out)
+        lines = self.run_cli("keys").splitlines()  # numbered like the vendor picture
+        self.assertEqual(len(lines), 8)
+        self.assertIn("mouse left", lines[0])
+        self.assertIn("mouse right", lines[1])
+        self.assertIn("mouse forward", lines[3])
+        self.assertIn("dpi-loop", lines[5])
+        self.assertIn("rgb", lines[6])
+        self.assertIn("BT / 2.4G switch (fixed)", lines[7])
 
     def test_led_uses_mouse_state(self):
         self.run_cli("-c", "blue")
@@ -300,40 +304,53 @@ class BindTests(CliTests):
         return self.cfg()["keys"][slot]
 
     def test_bind_function_and_button(self):
-        out = self.run_cli("bind", "6", "dpi-")
+        out = self.run_cli("bind", "6", "dpi-")          # button 6 = DPI button = slot 1
         self.assertIn("verified: yes", out)
-        e = self.entry(6)
+        e = self.entry(1)
         self.assertEqual((e["type"], e["code"], e["ok"]), (2, 3, True))
-        self.run_cli("bind", "0", "back")
+        self.run_cli("bind", "3", "back")                 # button 3 = wheel = slot 0
         self.assertEqual((self.entry(0)["type"], self.entry(0)["code"]), (1, 0x08))
-        self.run_cli("bind", "4", "none")
+        self.run_cli("bind", "7", "none")                 # button 7 = LED strip button = slot 4
         self.assertEqual((self.entry(4)["type"], self.entry(4)["code"]), (0, 0))
 
     def test_bind_keystroke(self):
-        out = self.run_cli("bind", "6", "key:ctrl+shift+t")
+        out = self.run_cli("bind", "2", "key:ctrl+shift+t")   # button 2 = right = slot 3
         self.assertIn("verified: yes", out)
-        e = self.entry(6)
-        self.assertEqual((e["type"], e["code"], e["param"], e["ok"]), (4, 6, 1, True))
-        base = 0x200 + 6 * 0x180
+        e = self.entry(3)
+        self.assertEqual((e["type"], e["code"], e["param"], e["ok"]), (4, 3, 1, True))
+        base = 0x200 + 3 * 0x180
         self.assertEqual(bytes(self.fake.mem[base + 0x1D:base + 0x1F]), b"\x52\x03")
-        self.assertIn("slot 6: key:ctrl+shift+t", self.run_cli("keys"))
+        self.assertIn("key:ctrl+shift+t", self.run_cli("keys").splitlines()[1])
 
     def test_rebind_over_known_macro_is_fine_unknown_needs_force(self):
-        self.run_cli("bind", "6", "key:a")
-        self.run_cli("bind", "6", "key:b")  # decodable -> ok
-        self.assertIn("key:b", self.run_cli("keys"))
-        # corrupt the macro -> unknown format
-        base = 0x200 + 6 * 0x180
-        self.fake.mem[base + 0x20] ^= 0xFF
+        self.run_cli("bind", "2", "key:a")
+        self.run_cli("bind", "2", "key:b")  # decodable -> ok
+        self.assertIn("key:b", self.run_cli("keys").splitlines()[1])
+        base = 0x200 + 3 * 0x180
+        self.fake.mem[base + 0x20] ^= 0xFF  # corrupt -> unknown format
         with self.assertRaises(SystemExit):
-            self.run_cli("bind", "6", "left")
-        self.run_cli("bind", "6", "left", "--force")
-        self.assertEqual(self.entry(6)["type"], 1)
+            self.run_cli("bind", "2", "left")
+        self.run_cli("bind", "2", "left", "--force")
+        self.assertEqual(self.entry(3)["type"], 1)
 
     def test_bad_input(self):
-        for args in (("bind", "9", "left"), ("bind", "1", "fly"), ("bind", "1", "key:ctrl+nope")):
+        for args in (("bind", "9", "left"), ("bind", "0", "left"), ("bind", "1", "fly"),
+                     ("bind", "1", "key:ctrl+nope")):
             with self.assertRaises(SystemExit):
                 self.run_cli(*args)
+
+    def test_bt_switch_button_is_protected(self):
+        before = bytes(self.fake.mem)
+        with self.assertRaises(SystemExit):
+            self.run_cli("bind", "8", "left")
+        with self.assertRaises(SystemExit):
+            self.run_cli("bind", "6", "left", "--slot")   # raw slot 6 is the same switch
+        self.assertEqual(bytes(self.fake.mem), before)
+
+    def test_raw_slot_flag(self):
+        self.run_cli("bind", "4", "dpi+", "--slot")       # raw slot 4, not button 4
+        e = self.entry(4)
+        self.assertEqual((e["type"], e["code"]), (2, 2))
 
     def test_backup_made_before_bind(self):
         self.run_cli("bind", "6", "dpi-")

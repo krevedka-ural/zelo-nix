@@ -37,13 +37,17 @@ def slot_action(mouse, k):
 
 
 def snapshot(mouse):
+    """cfg + 8 buttons. `buttons` is in the vendor's numbering (1..8), `slots` in memory order."""
     cfg = P.decode_config(mouse.read_config())
     slots = []
     for i, k in enumerate(cfg["keys"]):
-        slots.append({"slot": i, "action": slot_action(mouse, k), "ok": k["ok"],
-                      "raw": (k["type"], k["code"], k["param"]),
+        locked = i == P.BT_SWITCH_SLOT
+        slots.append({"slot": i, "button": P.SLOT_BUTTON[i], "locked": locked,
+                      "action": "bt-switch" if locked else slot_action(mouse, k),
+                      "ok": k["ok"], "raw": (k["type"], k["code"], k["param"]),
                       "factory": P.FACTORY_SLOTS[i]})
-    return {"cfg": cfg, "slots": slots}
+    buttons = sorted(slots, key=lambda x: x["button"])
+    return {"cfg": cfg, "slots": slots, "buttons": buttons}
 
 
 # --- writing ----------------------------------------------------------------
@@ -136,6 +140,9 @@ def bind(mouse, slot, action, wait=0.0, force=False):
     kind, spec = parse_action(action)
     if not 0 <= slot < P.KEY_SLOTS:
         raise ValueError(f"slot must be 0..{P.KEY_SLOTS - 1}")
+    if slot == P.BT_SWITCH_SLOT and not force:
+        raise P.ZeloError(f"button {P.BT_SWITCH_BUTTON} (slot {slot}) is the BT / 2.4G switch "
+                          "and can't be rebound")
     cur = P.decode_config(mouse.read_config())["keys"][slot]
     if not cur["ok"]:
         raise P.ZeloError("this slot failed its checksum, refusing to write")
@@ -159,6 +166,13 @@ def bind(mouse, slot, action, wait=0.0, force=False):
         return True
 
     return _result(ok, _check(same), backup=path)
+
+
+def bind_button(mouse, button, action, wait=0.0, force=False):
+    """Same as bind(), but `button` is the number from the vendor picture (1..8)."""
+    if button not in P.BUTTON_SLOT:
+        raise ValueError("button must be 1..8")
+    return bind(mouse, P.BUTTON_SLOT[button], action, wait=wait, force=force)
 
 
 def summarize(results):
