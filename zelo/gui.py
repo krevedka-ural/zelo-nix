@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -69,6 +69,29 @@ MODE_CHOICES = [  # (label, zelo mode name); order of modes is inferred from the
 ]
 
 COLOR_PRESETS = [(n, c) for n, c in cli.COLORS.items() if n != "yelow"]
+
+
+# Short caption printed under each function button ("1: ЛКМ")
+BUTTON_CAPTIONS = {
+    1: "ЛКМ",
+    2: "ПКМ",
+    3: "Колесо",
+    4: "Вперёд (бок.)",
+    5: "Назад (бок.)",
+    6: "DPI",
+    7: "Подсветка",
+    8: "BT / 2.4G",
+}
+
+# Layout around the picture: which buttons sit left / right of the mouse (top to bottom),
+# and the y of each number badge in the original 242x335 picture (used to align them).
+LEFT_BUTTONS = (1, 7, 4, 5)
+RIGHT_BUTTONS = (2, 3, 6)
+BADGE_Y = {1: 57, 7: 130, 4: 157, 5: 185, 2: 57, 3: 102, 6: 188}
+PIC_ORIG = (242, 335)
+PIC_WIDTH = 363          # picture is shown 1.5x
+FUNC_W, FUNC_BTN_H, FUNC_CAP_H = 170, 26, 16
+GAP = 10
 
 
 def mouse_pixmap():
@@ -239,52 +262,88 @@ class ActionDialog(QDialog):
 # 3. tabs
 # ---------------------------------------------------------------------------
 
+class FunctionButton(QWidget):
+    """[ function ] with the physical button's caption below it: "1: ЛКМ"."""
+
+    def __init__(self, parent, number, on_click):
+        super().__init__(parent)
+        self.number = number
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.btn = QPushButton("—")
+        self.btn.setFixedHeight(FUNC_BTN_H)
+        self.btn.clicked.connect(lambda _=False: on_click(number))
+        self.caption = QLabel(f"{number}: {BUTTON_CAPTIONS[number]}")
+        self.caption.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.caption.setStyleSheet("color: gray;")
+        self.caption.setToolTip(BUTTON_TITLES[number])
+        lay.addWidget(self.btn)
+        lay.addWidget(self.caption)
+        self.setFixedSize(FUNC_W, FUNC_BTN_H + 2 + FUNC_CAP_H)
+
+    def set_function(self, text):
+        shown = QFontMetrics(self.btn.font()).elidedText(
+            text, Qt.TextElideMode.ElideRight, FUNC_W - 16)
+        self.btn.setText(shown)
+        self.btn.setToolTip(text)
+
+
 class ButtonsTab(QWidget):
     def __init__(self, win):
         super().__init__()
         self.win = win
         self.buttons = []
-        outer = QHBoxLayout(self)
+        self.func = {}   # button number -> FunctionButton
+        outer = QVBoxLayout(self)
+        outer.addWidget(QLabel("Нажмите на функцию, чтобы изменить её. Под ней — какая это кнопка мыши."))
 
         pm = mouse_pixmap()
-        if pm is not None:
-            pic = QLabel()
-            pic.setPixmap(pm.scaledToHeight(380, Qt.TransformationMode.SmoothTransformation))
-            pic.setAlignment(Qt.AlignmentFlag.AlignTop)
-            outer.addWidget(pic)
+        pic_w = PIC_WIDTH
+        scale = pic_w / (pm.width() if pm is not None else PIC_ORIG[0])
+        pic_h = int(round((pm.height() if pm is not None else PIC_ORIG[1]) * scale))
+        total_w = FUNC_W + GAP + pic_w + GAP + FUNC_W
+        total_h = pic_h + GAP + FUNC_BTN_H + 2 + FUNC_CAP_H
 
-        right = QVBoxLayout()
-        right.addWidget(QLabel("Номера — как на картинке. «По умолчанию» — заводское назначение."))
-        grid = QGridLayout()
-        for col, title in enumerate(("№", "Кнопка", "По умолчанию", "Сейчас", "")):
-            grid.addWidget(QLabel(f"<b>{title}</b>"), 0, col)
-        self.now_labels = []   # index = button number - 1
-        self.edit_buttons = []
-        for n in range(1, P.KEY_SLOTS + 1):
-            grid.addWidget(QLabel(str(n)), n, 0)
-            grid.addWidget(QLabel(BUTTON_TITLES[n]), n, 1)
-            factory = P.BUTTON_FACTORY[n]
-            grid.addWidget(QLabel(ACTION_LABEL.get(factory, factory)), n, 2)
-            now = QLabel("—")
-            self.now_labels.append(now)
-            grid.addWidget(now, n, 3)
-            btn = QPushButton("Изменить…")
-            if n == P.BT_SWITCH_BUTTON:
-                btn.setEnabled(False)
-                btn.setToolTip("Эту кнопку обрабатывает прошивка мыши, переназначить её нельзя")
-            else:
-                btn.clicked.connect(lambda _=False, b=n: self.edit(b))
-            self.edit_buttons.append(btn)
-            grid.addWidget(btn, n, 4)
-        grid.setColumnStretch(3, 1)
-        right.addLayout(grid)
-        right.addStretch(1)
-        outer.addLayout(right, 1)
+        stage = QWidget()
+        stage.setFixedSize(total_w, total_h)
+        pic = QLabel(stage)
+        pic.setFixedSize(pic_w, pic_h)
+        if pm is not None:
+            pic.setPixmap(pm.scaledToWidth(pic_w, Qt.TransformationMode.SmoothTransformation))
+        else:
+            pic.setText("(нет картинки mouse.png)")
+            pic.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pic.move(FUNC_W + GAP, 0)
+
+        func_h = FUNC_BTN_H + 2 + FUNC_CAP_H
+        for numbers, x in ((LEFT_BUTTONS, 0), (RIGHT_BUTTONS, FUNC_W + GAP + pic_w + GAP)):
+            bottom = -GAP
+            for n in numbers:  # aligned with the number badge, pushed down so blocks never overlap
+                y = max(0, int(BADGE_Y[n] * scale - func_h / 2), bottom + 4)
+                fb = FunctionButton(stage, n, self.edit)
+                fb.move(x, y)
+                self.func[n] = fb
+                bottom = y + func_h
+        bt = FunctionButton(stage, P.BT_SWITCH_BUTTON, self.edit)
+        bt.btn.setEnabled(False)
+        bt.btn.setToolTip("Эту кнопку обрабатывает прошивка мыши, переназначить её нельзя")
+        bt.move((total_w - FUNC_W) // 2, pic_h + GAP)
+        self.func[P.BT_SWITCH_BUTTON] = bt
+        for fb in self.func.values():
+            fb.show()
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(stage)
+        row.addStretch(1)
+        outer.addLayout(row)
+        outer.addStretch(1)
 
     def load(self, snap):
         self.buttons = snap["buttons"]
         for b in self.buttons:
-            self.now_labels[b["button"] - 1].setText(action_text(b["action"], b["raw"]))
+            self.func[b["button"]].set_function(action_text(b["action"], b["raw"]))
 
     def edit(self, button):
         current = None
@@ -470,7 +529,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Zelotes F-36")
-        self.resize(680, 560)
+        self.resize(800, 720)
         self.snapshot = None
         self._ids = itertools.count(1)
         self._tasks = {}      # tid -> Task (keeps the runnable alive)

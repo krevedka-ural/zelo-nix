@@ -54,12 +54,15 @@ class GuiTests(unittest.TestCase):
         return P.decode_config(bytes(self.fake.mem[:P.CONFIG_LEN]))
 
     def test_buttons_loaded(self):
-        labels = [l.text() for l in self.win.buttons_tab.now_labels]  # index = button number - 1
-        self.assertEqual(labels[0], "Левая кнопка")
-        self.assertEqual(labels[2], "Средняя кнопка")
-        self.assertEqual(labels[5], "DPI: по кругу")
-        self.assertEqual(labels[7], "Переключение BT / 2.4G")
-        self.assertFalse(self.win.buttons_tab.edit_buttons[7].isEnabled())
+        f = self.win.buttons_tab.func  # button number -> FunctionButton
+        self.assertEqual(f[1].btn.text(), "Левая кнопка")
+        self.assertEqual(f[3].btn.text(), "Средняя кнопка")
+        self.assertEqual(f[6].btn.text(), "DPI: по кругу")
+        self.assertEqual(f[8].btn.text(), "Переключение BT / 2.4G")
+        self.assertFalse(f[8].btn.isEnabled())
+        self.assertTrue(f[1].btn.isEnabled())
+        self.assertEqual(f[1].caption.text(), "1: ЛКМ")
+        self.assertEqual(sorted(f), list(range(1, 9)))
 
     def test_light_apply(self):
         t = self.win.light_tab
@@ -100,7 +103,7 @@ class GuiTests(unittest.TestCase):
         self.win.buttons_tab.edit(2)          # button 2 = right button = memory slot 3
         e = self.cfg()["keys"][3]
         self.assertEqual((e["type"], e["code"]), (4, 3))
-        self.assertEqual(self.win.buttons_tab.now_labels[1].text(), "Клавиши: ctrl+shift+t")
+        self.assertEqual(self.win.buttons_tab.func[2].btn.text(), "Клавиши: ctrl+shift+t")
 
 
 if __name__ == "__main__":
